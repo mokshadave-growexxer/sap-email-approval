@@ -1,4 +1,4 @@
-import { sapSessionManager } from '../../sap/SapSessionManager.js';
+import { currentSL } from '../company/companyContext.js';
 import logger from '../../config/logger.js';
 
 export const STATUS = Object.freeze({
@@ -182,8 +182,14 @@ export async function postApprovedDraft(sessionManager, draftEntry) {
 }
 
 export class ApprovalService {
-  constructor(sessionManager = sapSessionManager) {
-    this.sessionManager = sessionManager;
+  constructor(sessionManager = null) {
+    this._sessionManager = sessionManager;
+  }
+
+  // The active company's Service Layer session, unless a manager was injected
+  // (tests). Resolved per call so one service instance serves every company.
+  get sessionManager() {
+    return this._sessionManager ?? currentSL();
   }
 
   /**

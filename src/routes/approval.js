@@ -2,16 +2,36 @@ import express from 'express';
 import logger from '../config/logger.js';
 import { ApprovalService, ApprovalSapError, ApprovalUnauthorizedError } from '../services/sap/approvalService.js';
 import {
-  ACTIONS,
-  TokenAlreadyUsedError,
-  TokenExpiredError,
-  TokenInvalidError,
-  consumeToken,
-  validateToken,
-} from '../services/security/tokenService.js';
+  GATE_FAILURE,
+  consumeFootprintSession,
+  getClientIp,
+} from '../services/security/footprintService.js';
+import { getApproverPassword, UnknownApproverError } from '../services/security/userCredentialStore.js';
+import {
+  PROCESS_FAILURE,
+  PROCESS_STATUS,
+  claimProcess,
+  expireProcess,
+  getProcess,
+  markProcessDecided,
+  releaseProcess,
+} from '../services/approval/processStore.js';
+import {
+  createPendingDecision,
+  logFailedDecision,
+  markDecisionFailed,
+  markDecisionSuccess,
+} from '../services/audit/decisionLogService.js';
+import { scheduleFinalDocReconciliation } from '../services/audit/finalDocReconciler.js';
+import { writeDecisionRemark } from '../services/sap/decisionRemarkStore.js';
+import { linkApprovalFootprintsToDocument } from '../services/sap/footprintDocumentLinker.js';
+import { getSalesOrderChangeStatus } from '../services/sap/draftStatusService.js';
+import { currentCompany, currentCompanyHash } from '../services/company/companyContext.js';
 
 const router = express.Router();
 const approvalService = new ApprovalService();
+
+const ACTIONS = Object.freeze({ APPROVE: 'approve', REJECT: 'reject' });
 
 function escapeHtml(value) {
   return String(value ?? '')
@@ -21,14 +41,16 @@ function escapeHtml(value) {
     .replace(/"/g, '&quot;');
 }
 
-function renderDecisionPage({ action, payload, token, errorMessage = '' }) {
+function renderDecisionPage({ action, process, processId, companyHash, errorMessage = '' }) {
   const title = action === ACTIONS.APPROVE ? 'Approve Request' : 'Reject Request';
-  const buttonLabel = action === ACTIONS.APPROVE ? 'Approve' : 'Reject';
+  const question =
+    action === ACTIONS.APPROVE
+      ? 'Are you sure you want to approve this Sales Order?'
+      : 'Are you sure you want to reject this Sales Order?';
+  const buttonLabel = action === ACTIONS.APPROVE ? 'Yes, Approve' : 'Yes, Reject';
   const buttonColor = action === ACTIONS.APPROVE ? '#1a7f37' : '#b42318';
-  const approvalRequestId = escapeHtml(payload?.approvalRequestId);
-  const approverUserId = escapeHtml(payload?.approverUserId);
-  const stageId = escapeHtml(payload?.stageId);
-  const remarksValue = '';
+  const approvalRequestId = escapeHtml(process?.approval_request_id);
+  const level = escapeHtml(process?.level);
 
   return `<!DOCTYPE html>
 <html lang="en">
@@ -38,64 +60,68 @@ function renderDecisionPage({ action, payload, token, errorMessage = '' }) {
   <title>${escapeHtml(title)}</title>
   <style>
     body { margin:0; font-family: Arial, Helvetica, sans-serif; background:#f4f5f7; color:#1f2937; }
-    .wrap { max-width: 720px; margin: 0 auto; padding: 32px 16px; }
-    .card { background:#fff; border-radius: 10px; box-shadow: 0 6px 24px rgba(15,23,42,.08); overflow:hidden; }
-    .head { background:#1a2b4c; color:#fff; padding: 20px 28px; }
+    .wrap { max-width: 560px; margin: 0 auto; padding: 40px 16px; }
+    .card { background:#fff; border-radius: 12px; box-shadow: 0 8px 30px rgba(15,23,42,.10); overflow:hidden; }
+    .head { background:#1a2b4c; color:#fff; padding: 22px 28px; font-size:18px; font-weight:700; }
     .body { padding: 28px; }
-    .meta { background:#f9fafb; border-radius: 8px; padding: 16px; margin: 18px 0 24px; }
-    .meta div { display:flex; justify-content:space-between; gap:16px; padding: 6px 0; font-size: 14px; }
-    label { display:block; font-weight:700; margin: 14px 0 8px; }
-    input, textarea { width:100%; box-sizing:border-box; border:1px solid #d1d5db; border-radius:8px; padding:12px 14px; font-size:14px; }
-    textarea { min-height: 120px; resize: vertical; }
-    .actions { margin-top: 22px; display:flex; gap:12px; flex-wrap:wrap; }
-    button { border:0; border-radius:8px; padding:12px 18px; font-size:14px; font-weight:700; color:#fff; cursor:pointer; }
-    .secondary { background:#6b7280; text-decoration:none; display:inline-flex; align-items:center; }
-    .notice { margin-top: 18px; padding: 12px 14px; border-radius:8px; background:${errorMessage ? '#fef2f2' : '#ecfdf5'}; color:${errorMessage ? '#991b1b' : '#065f46'}; }
-    .small { color:#6b7280; font-size:12px; margin-top: 14px; line-height:1.5; }
+    .q { font-size:18px; font-weight:700; margin:0 0 6px; }
+    .meta { background:#f9fafb; border-radius: 8px; padding: 14px 16px; margin: 18px 0; }
+    .meta div { display:flex; justify-content:space-between; gap:16px; padding: 5px 0; font-size: 14px; }
+    label { display:block; font-weight:700; margin: 14px 0 8px; font-size:14px; }
+    textarea { width:100%; box-sizing:border-box; border:1px solid #d1d5db; border-radius:8px; padding:12px 14px; font-size:14px; min-height:84px; resize:vertical; }
+    .status { display:flex; align-items:center; gap:10px; margin: 18px 0; padding:12px 14px; border-radius:8px; background:#f3f4f6; color:#374151; font-size:14px; }
+    .status.ok { background:#ecfdf5; color:#065f46; }
+    .status.err { background:#fef2f2; color:#991b1b; }
+    .spinner { width:16px; height:16px; border:2px solid #cbd5e1; border-top-color:#1a2b4c; border-radius:50%; animation:spin .8s linear infinite; flex:0 0 auto; }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    .actions { margin-top: 8px; display:flex; gap:12px; flex-wrap:wrap; align-items:center; }
+    button { border:0; border-radius:8px; padding:13px 22px; font-size:15px; font-weight:700; color:#fff; cursor:pointer; }
+    button[disabled] { opacity:.45; cursor:not-allowed; }
+    .secondary { background:#6b7280; text-decoration:none; display:inline-flex; align-items:center; padding:13px 20px; border-radius:8px; color:#fff; font-size:15px; font-weight:700; }
+    #geo-retry { background:#374151; display:none; }
+    .small { color:#6b7280; font-size:12px; margin-top: 16px; line-height:1.5; }
   </style>
 </head>
 <body>
   <div class="wrap">
     <div class="card">
-      <div class="head"><strong>${escapeHtml(title)}</strong></div>
+      <div class="head">${escapeHtml(title)}</div>
       <div class="body">
-        <p>This approval link is tied to a single token and a single action.</p>
+        <p class="q">${escapeHtml(question)}</p>
         <div class="meta">
           <div><span>Approval Request</span><strong>${approvalRequestId}</strong></div>
-          <div><span>Approver User ID</span><strong>${approverUserId}</strong></div>
-          <div><span>Stage ID</span><strong>${stageId}</strong></div>
-          <div><span>Action</span><strong>${escapeHtml(action)}</strong></div>
+          <div><span>Approval Level</span><strong>${level}</strong></div>
         </div>
 
-        ${errorMessage ? `<div class="notice">${escapeHtml(errorMessage)}</div>` : ''}
+        ${errorMessage ? `<div class="status err">${escapeHtml(errorMessage)}</div>` : ''}
 
-        <form method="post" action="/api/v1/${escapeHtml(action)}/${escapeHtml(token)}">
-          <label for="username">SAP Username</label>
-          <input id="username" name="username" autocomplete="username" required />
+        <form method="post" action="/api/v1/c/${escapeHtml(companyHash)}/${escapeHtml(action)}/${escapeHtml(processId)}" data-process-id="${escapeHtml(processId)}" data-register-url="/api/v1/c/${escapeHtml(companyHash)}/footprint/register">
+          <input type="hidden" id="session_id" name="session_id" value="" />
 
-          <label for="password">SAP Password</label>
-          <input id="password" name="password" type="password" autocomplete="current-password" required />
+          <label for="remarks">Remarks (optional)</label>
+          <textarea id="remarks" name="remarks" placeholder="Add a note for the audit trail..."></textarea>
 
-          <label for="remarks">Remarks</label>
-          <textarea id="remarks" name="remarks" placeholder="Optional remarks...">${escapeHtml(remarksValue)}</textarea>
+          <div id="geo-status" class="status"><span class="spinner"></span><span id="geo-text">Verifying your device and location…</span></div>
 
           <div class="actions">
-            <button type="submit" style="background:${buttonColor};">${escapeHtml(buttonLabel)}</button>
-            <a class="secondary" href="/api/v1/health">Cancel</a>
+            <button id="decision-submit" type="submit" style="background:${buttonColor};" disabled>${escapeHtml(buttonLabel)}</button>
+            <button id="geo-retry" type="button">Retry</button>
           </div>
         </form>
 
         <div class="small">
-          If you were not expecting this email, you can ignore it. The token will expire automatically and cannot be reused once approved or rejected.
+          No SAP password is required — your identity is verified from your registered profile and device fingerprint. This link works once and expires automatically.
         </div>
       </div>
     </div>
   </div>
+  <script src="/api/v1/c/${escapeHtml(companyHash)}/footprint/client.js"></script>
 </body>
 </html>`;
 }
 
 function renderResultPage({ title, message, details = '' }) {
+  const isError = /error|required|expired|invalid|denied/i.test(title);
   return `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -104,18 +130,19 @@ function renderResultPage({ title, message, details = '' }) {
   <title>${escapeHtml(title)}</title>
   <style>
     body { margin:0; font-family: Arial, Helvetica, sans-serif; background:#f4f5f7; color:#1f2937; }
-    .wrap { max-width: 720px; margin: 0 auto; padding: 32px 16px; }
-    .card { background:#fff; border-radius: 10px; box-shadow: 0 6px 24px rgba(15,23,42,.08); padding: 28px; }
-    .ok { color:#065f46; background:#ecfdf5; padding:12px 14px; border-radius:8px; }
-    .err { color:#991b1b; background:#fef2f2; padding:12px 14px; border-radius:8px; }
-    .small { margin-top: 14px; color:#6b7280; font-size:12px; line-height:1.5; }
+    .wrap { max-width: 560px; margin: 0 auto; padding: 48px 16px; }
+    .card { background:#fff; border-radius: 12px; box-shadow: 0 8px 30px rgba(15,23,42,.10); padding: 32px; }
+    h1 { margin:0 0 16px; font-size:20px; }
+    .ok { color:#065f46; background:#ecfdf5; padding:14px 16px; border-radius:8px; }
+    .err { color:#991b1b; background:#fef2f2; padding:14px 16px; border-radius:8px; }
+    .small { margin-top: 16px; color:#6b7280; font-size:12px; line-height:1.5; }
   </style>
 </head>
 <body>
   <div class="wrap">
     <div class="card">
       <h1>${escapeHtml(title)}</h1>
-      <div class="${title.toLowerCase().includes('error') ? 'err' : 'ok'}">${escapeHtml(message)}</div>
+      <div class="${isError ? 'err' : 'ok'}">${escapeHtml(message)}</div>
       ${details ? `<div class="small">${escapeHtml(details)}</div>` : ''}
     </div>
   </div>
@@ -125,102 +152,174 @@ function renderResultPage({ title, message, details = '' }) {
 
 function toHumanMessage(error) {
   if (error instanceof ApprovalUnauthorizedError) return 'You are not authorized to do this action.';
-  if (error instanceof TokenExpiredError) return 'This approval link has expired.';
-  if (error instanceof TokenAlreadyUsedError) return 'This approval link has already been used.';
-  if (error instanceof TokenInvalidError) return error.message;
-  if (error instanceof ApprovalSapError && error.meta?.friendlyMessage) {
-    return error.meta.friendlyMessage;
+  if (error instanceof UnknownApproverError) {
+    return 'Your SAP profile is not enrolled for one-click approval. Please contact your SAP administrator.';
   }
+  if (error instanceof ApprovalSapError && error.meta?.friendlyMessage) return error.meta.friendlyMessage;
   if (error instanceof ApprovalSapError && error.meta?.cause) {
     return `${error.message} | SAP detail: ${typeof error.meta.cause === 'string' ? error.meta.cause : JSON.stringify(error.meta.cause)}`;
   }
   return error?.message || 'Unexpected error';
 }
 
+const FAILURE_MESSAGES = Object.freeze({
+  [GATE_FAILURE.NO_SESSION]:
+    'Location verification is required before you can decide. Please reopen the link and allow location access.',
+  [GATE_FAILURE.GEO_DENIED]:
+    'Location access was denied. Please enable location permissions, reload the link, and try again.',
+  [GATE_FAILURE.ALREADY_CONSUMED]:
+    'This link has already been submitted. If you need to make a change, contact your SAP administrator.',
+  [GATE_FAILURE.EXPIRED]:
+    'Your verification window has expired. Please reopen the link and allow location access again.',
+  [PROCESS_FAILURE.NOT_FOUND]: 'This approval link is invalid.',
+  [PROCESS_FAILURE.EXPIRED]: 'This approval link has expired.',
+  [PROCESS_FAILURE.ALREADY_DECIDED]: 'This request has already been decided.',
+});
+
+function failureMessage(reason) {
+  return FAILURE_MESSAGES[reason] || 'This decision could not be verified. Please reopen the link and try again.';
+}
+
+function linkTimestamps(process) {
+  return { linkSentAt: process?.sent_at ?? null, linkExpiry: process?.expires_at ?? null };
+}
+
+function buildSapResponseForLog(error) {
+  if (error instanceof ApprovalSapError) {
+    return { message: error.message, code: error.code ?? null, meta: error.meta ?? null };
+  }
+  return { message: error?.message || String(error) };
+}
+
 async function handleDecision(req, res, action) {
-  const { token } = req.params;
+  const { processId } = req.params;
+  const process = await getProcess(processId);
 
-  try {
-    const payload = await validateToken(token);
+  if (!process) {
+    return res.status(404).send(
+      renderResultPage({ title: 'Invalid Link', message: 'This approval link is invalid or no longer exists.' })
+    );
+  }
 
-    if (payload.action !== action) {
-      return res.status(400).send(
-        renderResultPage({
-          title: 'Action Mismatch',
-          message: 'This link was created for a different action.',
-        })
-      );
-    }
-
-    const isGet = req.method === 'GET';
-    if (isGet) {
-      return res.status(200).send(renderDecisionPage({ action, payload, token }));
-    }
-
-    const approvalRequestId = payload.approvalRequestId;
-    const approverUserId = payload.approverUserId;
-    const approverUsername = req.body?.username;
-    const approverPassword = req.body?.password;
-    const remarks = req.body?.remarks || '';
-
-    const operation =
-      action === ACTIONS.APPROVE
-        ? approvalService.approveRequest(
-            {
-              approvalRequestId,
-              approverUserId,
-              approverUsername,
-              approverPassword,
-              remarks,
-            },
-            undefined,
-            remarks
-          )
-        : approvalService.rejectRequest(
-            {
-              approvalRequestId,
-              approverUserId,
-              approverUsername,
-              approverPassword,
-              remarks,
-            },
-            undefined,
-            remarks
-          );
-
-    const result = await operation;
-
-    let consumeWarning = '';
-    try {
-      await consumeToken(payload.jti);
-    } catch (consumeError) {
-      logger.error('approval route: token consumption failed after successful SAP decision', {
-        jti: payload.jti,
-        approvalRequestId,
-        error: consumeError?.message || String(consumeError),
-      });
-      consumeWarning = 'SAP action succeeded, but the token could not be marked as used. Please review the token store.';
-    }
-
-    const draftPostWarning =
-      result?.draftPost?.attempted && result.draftPost.success === false
-        ? result.draftPost.error ||
-          'Approval succeeded, but the approved draft could not be posted. Manual or automatic retry is required.'
-        : '';
-
-    return res.status(200).send(
+  // Refuse an already-decided or expired link before any footprint work.
+  if (process.status !== PROCESS_STATUS.PENDING) {
+    return res.status(410).send(
       renderResultPage({
-        title: action === ACTIONS.APPROVE ? 'Approval Completed' : 'Rejection Completed',
-        message: `Request ${result.approvalRequestId} was processed successfully.`,
-        details: [
-          `Current SAP status: ${result.currentStatus ?? 'unknown'}`,
-          draftPostWarning,
-          consumeWarning,
-        ]
-          .filter(Boolean)
-          .join(' '),
+        title: 'Link No Longer Active',
+        message:
+          process.status === PROCESS_STATUS.EXPIRED
+            ? 'This approval link has expired.'
+            : 'This request has already been decided.',
       })
     );
+  }
+  if (new Date(process.expires_at).getTime() < Date.now()) {
+    await expireProcess(processId);
+    return res.status(410).send(
+      renderResultPage({ title: 'Link Expired', message: 'This approval link has expired.' })
+    );
+  }
+
+  if (req.method === 'GET') {
+    return res.status(200).send(renderDecisionPage({ action, process, processId, companyHash: currentCompanyHash() }));
+  }
+
+  return handleDecisionPost(req, res, action, processId, process);
+}
+
+async function handleDecisionPost(req, res, action, processId, process) {
+  const sessionId = req.body?.session_id;
+  const postIp = getClientIp(req);
+  const userAgent = req.headers['user-agent'] || null;
+  const { linkSentAt, linkExpiry } = linkTimestamps(process);
+
+  const auditFailure = (failureReason, footprintSessionId = null) =>
+    logFailedDecision({
+      processId,
+      approvalRequestId: process.approval_request_id,
+      action,
+      approverUserId: process.sap_user_id,
+      userCode: process.user_code,
+      postIpAddress: postIp,
+      userAgent,
+      linkSentAt,
+      linkExpiry,
+      footprintSessionId,
+      failureReason,
+    });
+
+  // Footprint gate (the location/device boundary) — verified in the DB, not the button.
+  const gate = await consumeFootprintSession({ sessionId, processId });
+  if (!gate.ok) {
+    await auditFailure(gate.reason, sessionId || null);
+    logger.warn('approval route: footprint gate rejected decision', { processId, reason: gate.reason });
+    return res.status(403).send(
+      renderResultPage({ title: 'Verification Required', message: failureMessage(gate.reason) })
+    );
+  }
+  const session = gate.session;
+
+  // Claim the process (one-time + expiry), race-safe.
+  const claim = await claimProcess(processId);
+  if (!claim.ok) {
+    await auditFailure(claim.reason, session.session_id);
+    logger.warn('approval route: process claim rejected decision', { processId, reason: claim.reason });
+    return res.status(410).send(
+      renderResultPage({ title: 'Link No Longer Active', message: failureMessage(claim.reason) })
+    );
+  }
+
+  if (session.ip_address && postIp && session.ip_address !== postIp) {
+    logger.info('approval route: IP differs between footprint capture and decision', {
+      processId,
+      footprintIp: session.ip_address,
+      postIp,
+    });
+  }
+
+  const { id: decisionLogId } = await createPendingDecision({
+    processId,
+    approvalRequestId: process.approval_request_id,
+    action,
+    approverUserId: process.sap_user_id,
+    userCode: process.user_code,
+    approverEmail: process.approver_email,
+    session,
+    postIpAddress: postIp,
+    linkSentAt,
+    linkExpiry,
+  });
+
+  let approverPassword;
+  try {
+    approverPassword = await getApproverPassword(process.user_code);
+  } catch (error) {
+    await releaseProcess(processId);
+    await markDecisionFailed(decisionLogId, error?.message || String(error));
+    logger.error('approval route: credential resolution failed', {
+      processId,
+      userCode: process.user_code,
+      error: error?.message || String(error),
+    });
+    return res.status(403).send(
+      renderResultPage({ title: 'Not Enrolled', message: toHumanMessage(error) })
+    );
+  }
+
+  let result;
+  try {
+    const params = {
+      approvalRequestId: process.approval_request_id,
+      approverUserId: process.sap_user_id,
+      approverUsername: process.user_code,
+      approverPassword,
+      remarks: req.body?.remarks || '',
+    };
+
+    result =
+      action === ACTIONS.APPROVE
+        ? await approvalService.approveRequest(params, undefined, params.remarks)
+        : await approvalService.rejectRequest(params, undefined, params.remarks);
   } catch (error) {
     if (error instanceof ApprovalSapError) {
       logger.error('approval route: SAP decision failed', {
@@ -231,26 +330,99 @@ async function handleDecision(req, res, action) {
       });
     }
 
-    const status =
-      error instanceof ApprovalUnauthorizedError
-        ? 403
-        : error instanceof TokenExpiredError || error instanceof TokenAlreadyUsedError
-        ? 410
-        : 400;
+    await releaseProcess(processId);
+    await markDecisionFailed(decisionLogId, error?.message || String(error), buildSapResponseForLog(error));
+
+    const status = error instanceof ApprovalUnauthorizedError ? 403 : 400;
     return res.status(status).send(
-      renderDecisionPage({
-        action,
-        payload: {},
-        token,
-        errorMessage: toHumanMessage(error),
-      })
+      renderDecisionPage({ action, process, processId, companyHash: currentCompanyHash(), errorMessage: toHumanMessage(error) })
     );
   }
+
+  await markProcessDecided(processId, action);
+
+  const after = result?.sapResponse?.after;
+  const draftDocEntry = after?.DraftEntry ?? result?.draftPost?.draftEntry ?? process.draft_entry ?? null;
+  // The final Sales Order DocEntry is either returned by SaveDraftToDocument, or
+  // exposed as the ApprovalRequest's ObjectEntry once IsDraft flips to 'N'.
+  const draftPostFinal = result?.draftPost?.success
+    ? result.draftPost.result?.DocEntry ?? result.draftPost.result?.docEntry ?? null
+    : null;
+  const objectEntryFinal = after && String(after.IsDraft) === 'N' && Number(after.ObjectEntry) > 0
+    ? Number(after.ObjectEntry)
+    : null;
+  const syncFinalDocEntry = draftPostFinal ?? objectEntryFinal;
+
+  await markDecisionSuccess(decisionLogId, {
+    sapResponse: result?.sapResponse ?? null,
+    timezone: session.timezone,
+    draftDocEntry,
+    finalDocEntry: syncFinalDocEntry,
+  });
+
+  // Surface the approver's remark in SAP's Approval Status Report (WDD1.Remarks).
+  // The Service Layer writes it only intermittently, so it is written directly
+  // and deterministically here for this approver's line.
+  const remarkText = (req.body?.remarks || '').trim();
+  if (remarkText) {
+    await writeDecisionRemark({
+      approvalRequestId: process.approval_request_id,
+      sapUserId: process.sap_user_id,
+      remark: remarkText,
+    });
+  }
+
+  // Once the FINAL level approves and the draft becomes a Sales Order, record on
+  // each of this request's footprints which document it belongs to (DocEntry +
+  // DocNum) and whether that document was newly CREATED or an existing one
+  // UPDATED. The CREATED/UPDATED signal must be read from the pre-decision
+  // snapshot: after conversion SAP sets ObjectEntry for new orders too, so it no
+  // longer distinguishes the two.
+  const changeType = getSalesOrderChangeStatus(result?.sapResponse?.before).code;
+
+  if (action === ACTIONS.APPROVE && result?.currentStatus === 'arsApproved') {
+    if (syncFinalDocEntry != null) {
+      linkApprovalFootprintsToDocument({
+        approvalRequestId: process.approval_request_id,
+        docEntry: syncFinalDocEntry,
+        changeType,
+      }).catch(() => {});
+    } else {
+      // Vendor add-on converts a few seconds later — fill final_doc_entry from the
+      // ApprovalRequest's ObjectEntry once it appears, and link the footprints then.
+      scheduleFinalDocReconciliation({
+        decisionLogId,
+        approvalRequestId: process.approval_request_id,
+        draftDocEntry,
+        company: currentCompany(),
+        onResolved: (docEntry) =>
+          linkApprovalFootprintsToDocument({
+            approvalRequestId: process.approval_request_id,
+            docEntry,
+            changeType,
+          }),
+      });
+    }
+  }
+
+  const draftPostWarning =
+    result?.draftPost?.attempted && result.draftPost.success === false
+      ? result.draftPost.error ||
+        'Approval succeeded, but the approved draft could not be posted. Manual or automatic retry is required.'
+      : '';
+
+  return res.status(200).send(
+    renderResultPage({
+      title: action === ACTIONS.APPROVE ? 'Approval Completed' : 'Rejection Completed',
+      message: `Request ${result.approvalRequestId} was processed successfully.`,
+      details: [`Current SAP status: ${result.currentStatus ?? 'unknown'}`, draftPostWarning].filter(Boolean).join(' '),
+    })
+  );
 }
 
-router.get('/approve/:token', (req, res) => handleDecision(req, res, ACTIONS.APPROVE));
-router.get('/reject/:token', (req, res) => handleDecision(req, res, ACTIONS.REJECT));
-router.post('/approve/:token', (req, res) => handleDecision(req, res, ACTIONS.APPROVE));
-router.post('/reject/:token', (req, res) => handleDecision(req, res, ACTIONS.REJECT));
+router.get('/approve/:processId', (req, res) => handleDecision(req, res, ACTIONS.APPROVE));
+router.get('/reject/:processId', (req, res) => handleDecision(req, res, ACTIONS.REJECT));
+router.post('/approve/:processId', (req, res) => handleDecision(req, res, ACTIONS.APPROVE));
+router.post('/reject/:processId', (req, res) => handleDecision(req, res, ACTIONS.REJECT));
 
 export default router;

@@ -1,19 +1,26 @@
 import { apiResponse } from '../utils/apiResponse.js';
-import { sapSessionManager } from '../sap/SapSessionManager.js';
+import { listCompanies, runInCompany, currentSL } from '../services/company/companyContext.js';
 
 export const healthSapCheck = async (req, res, next) => {
   try {
-    const session = await sapSessionManager.ensureLoggedIn();
+    const companies = await Promise.all(
+      listCompanies().map((company) =>
+        runInCompany(company, async () => {
+          try {
+            const session = await currentSL().ensureLoggedIn();
+            return { key: company.key, connected: true, version: session.version, company: session.company };
+          } catch (error) {
+            return { key: company.key, connected: false, error: error?.message || String(error) };
+          }
+        })
+      )
+    );
 
-    res.status(200).json(
+    const allConnected = companies.every((c) => c.connected);
+    res.status(allConnected ? 200 : 503).json(
       apiResponse.success({
-        message: 'SAP Service Layer connection is healthy',
-        data: {
-          connected: true,
-          version: session.version,
-          company: session.company,
-          sessionAlive: true,
-        },
+        message: allConnected ? 'SAP Service Layer connections are healthy' : 'One or more SAP companies are unreachable',
+        data: { companies },
       })
     );
   } catch (error) {

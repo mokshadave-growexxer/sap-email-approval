@@ -1,10 +1,12 @@
 import logger from '../../config/logger.js';
-import { sapSessionManager } from '../../sap/SapSessionManager.js';
-import { postgresQueueStore } from './queueStore.js';
+import { listCompanies, runInCompany, currentSL } from '../company/companyContext.js';
+import { queueStore as backendQueueStore } from './queueStore.js';
 import { sendApprovalEmail } from '../email/approvalEmailService.js';
 import { postApprovedDraft } from '../sap/approvalService.js';
 
 const POLL_INTERVAL_MS = 30_000;
+const EMAIL_MAX_SEND_ATTEMPTS = 5;
+const EMAIL_RETRY_BACKOFF_MINUTES = 2;
 
 const PENDING_APPROVALS_PATH =
   "/ApprovalRequests?$filter=Status%20eq%20'arsPending'%20and%20ObjectType%20eq%20'17'%20and%20IsDraft%20eq%20'Y'" +
@@ -26,7 +28,12 @@ const createDefaultQueueStore = () => ({
   },
   async markProcessing() {},
   async markSent() {},
+  async markSkipped() {},
   async markFailed() {},
+  async attachProcess() {},
+  async getRetryableFailedItems() {
+    return [];
+  },
 });
 
 const createDefaultLogger = () => logger;
@@ -70,8 +77,8 @@ function isKnownApprovalStage(knownStageKeys, approvalRequestId, currentStage, a
   return knownStageKeys.has(buildApprovalKey(approvalRequestId, currentStage, approverUserId));
 }
 
-function buildPostedDraftKey(approvalRequestId, draftEntry) {
-  return `${String(approvalRequestId ?? '')}:${String(draftEntry ?? '')}`;
+function buildPostedDraftKey(companyDb, approvalRequestId, draftEntry) {
+  return `${String(companyDb ?? '')}:${String(approvalRequestId ?? '')}:${String(draftEntry ?? '')}`;
 }
 
 function normalizeApprovalList(response) {
@@ -80,22 +87,27 @@ function normalizeApprovalList(response) {
 
 export function createQueueWorker({
   queueStore = createDefaultQueueStore(),
-  sapSessionManager: sessionManager = sapSessionManager,
+  sapSessionManager: injectedSessionManager = null,
   logger: workerLogger = createDefaultLogger(),
   onNewApprovalQueued = () => {},
   postApprovedDraftFn = postApprovedDraft,
   pollIntervalMs = POLL_INTERVAL_MS,
+  emailMaxSendAttempts = EMAIL_MAX_SEND_ATTEMPTS,
+  emailRetryBackoffMinutes = EMAIL_RETRY_BACKOFF_MINUTES,
 } = {}) {
   let pollTimer = null;
-  /** @type {Set<string>} Drafts successfully posted in this process (avoid re-POSTing every poll). */
+  /** @type {Set<string>} Drafts successfully posted in this process (avoid re-POSTing every poll). Keyed by company. */
   const postedDraftKeys = new Set();
 
+  // The active company's Service Layer session, unless one was injected (tests).
+  const resolveSession = () => injectedSessionManager ?? currentSL();
+
   async function fetchPendingApprovalRequests() {
-    await sessionManager.ensureLoggedIn();
+    await resolveSession().ensureLoggedIn();
 
     try {
       workerLogger.info('queueWorker: polling SAP approval requests');
-      const response = await sessionManager.client.get(PENDING_APPROVALS_PATH);
+      const response = await resolveSession().client.get(PENDING_APPROVALS_PATH);
       const pending = normalizeApprovalList(response);
       workerLogger.info('queueWorker: SAP poll completed', {
         count: Array.isArray(pending) ? pending.length : 0,
@@ -111,11 +123,11 @@ export function createQueueWorker({
   }
 
   async function fetchApprovedDraftRequests() {
-    await sessionManager.ensureLoggedIn();
+    await resolveSession().ensureLoggedIn();
 
     try {
       workerLogger.info('queueWorker: polling SAP approved draft requests');
-      const response = await sessionManager.client.get(APPROVED_DRAFTS_PATH);
+      const response = await resolveSession().client.get(APPROVED_DRAFTS_PATH);
       const approved = normalizeApprovalList(response);
       workerLogger.info('queueWorker: approved draft poll completed', {
         count: Array.isArray(approved) ? approved.length : 0,
@@ -161,7 +173,7 @@ export function createQueueWorker({
         continue;
       }
 
-      const postedKey = buildPostedDraftKey(approvalRequestId, draftEntry);
+      const postedKey = buildPostedDraftKey(resolveSession().companyDb, approvalRequestId, draftEntry);
       if (postedDraftKeys.has(postedKey)) {
         workerLogger.info('queueWorker: draft already posted in this process, skipping', {
           approvalRequestId,
@@ -171,7 +183,7 @@ export function createQueueWorker({
       }
 
       try {
-        const salesOrder = await postApprovedDraftFn(sessionManager, draftEntry);
+        const salesOrder = await postApprovedDraftFn(resolveSession(), draftEntry);
         postedDraftKeys.add(postedKey);
         workerLogger.info('queueWorker: posted approved draft sales order', {
           approvalRequestId,
@@ -244,10 +256,10 @@ export function createQueueWorker({
             continue;
           }
 
-          await queueStore.enqueue(item);
+          const queueId = await queueStore.enqueue(item);
           known.add(buildApprovalKey(approvalRequestId, currentStage, approverUserId));
           workerLogger.info('queueWorker: enqueued new approval', item);
-          await onNewApprovalQueued(item);
+          await attemptSend(queueId, item);
         } catch (error) {
           workerLogger.warn('queueWorker: enqueue skipped/failed', {
             approvalRequestId: req.Code,
@@ -258,23 +270,124 @@ export function createQueueWorker({
     }
   }
 
+  /**
+   * Send one approval email and record the outcome on its queue row:
+   *   sent    -> delivered; never resent
+   *   skipped -> intentionally not sent (e.g. test allowlist); never resent
+   *   failed  -> send errored; eligible for retry
+   * The process id is captured even on failure so a retry reuses the same link.
+   */
+  async function attemptSend(queueId, item) {
+    try {
+      const result = await onNewApprovalQueued(item);
+
+      if (result && result.skipped) {
+        if (queueId != null) await queueStore.markSkipped(queueId, result.reason);
+        workerLogger.info('queueWorker: email not sent (skipped)', {
+          approvalRequestId: item.approvalRequestId,
+          approverUserId: item.approverUserId,
+          reason: result.reason,
+        });
+        return;
+      }
+
+      if (queueId != null) {
+        if (result && result.processId) await queueStore.attachProcess(queueId, result.processId);
+        await queueStore.markSent(queueId);
+      }
+      workerLogger.info('queueWorker: email sent', {
+        approvalRequestId: item.approvalRequestId,
+        approverUserId: item.approverUserId,
+        processId: result?.processId ?? null,
+      });
+    } catch (error) {
+      if (queueId != null) {
+        if (error && error.processId) await queueStore.attachProcess(queueId, error.processId);
+        await queueStore.markFailed(queueId, error?.message || String(error));
+      }
+      workerLogger.warn('queueWorker: email send failed (will retry)', {
+        approvalRequestId: item.approvalRequestId,
+        approverUserId: item.approverUserId,
+        error: error?.message || String(error),
+      });
+    }
+  }
+
+  async function retryFailedEmails() {
+    let items;
+    try {
+      items = await queueStore.getRetryableFailedItems({
+        maxAttempts: emailMaxSendAttempts,
+        backoffMinutes: emailRetryBackoffMinutes,
+      });
+    } catch (error) {
+      workerLogger.error('queueWorker.retryFailedEmails: failed to load retryable items', {
+        error: error?.message || String(error),
+      });
+      return;
+    }
+
+    if (!Array.isArray(items) || items.length === 0) {
+      return;
+    }
+
+    workerLogger.info('queueWorker: retrying failed approval emails', { count: items.length });
+
+    for (const row of items) {
+      const item = {
+        approvalRequestId: row.approval_request_id,
+        currentStage: row.current_stage,
+        approverUserId: row.approver_user_id,
+        approverPosition: row.approver_position ?? null,
+        stageId: row.current_stage,
+        draftEntry: row.draft_entry ?? undefined,
+        processId: row.process_id ?? undefined,
+      };
+      await attemptSend(row.id, item);
+    }
+  }
+
   async function pollOnce() {
     await pollPendingApprovals();
+    await retryFailedEmails();
     await processApprovedDrafts();
+  }
+
+  // Production entry point: run one poll cycle for every configured company,
+  // each inside its own company context (schema + Service Layer session), so a
+  // company only ever sees its own drafts, approvers, and stored data. When a
+  // session is injected (tests) there is a single implicit company.
+  async function pollOnceAllCompanies() {
+    if (injectedSessionManager) {
+      return pollOnce();
+    }
+    for (const company of listCompanies()) {
+      try {
+        await runInCompany(company, () => pollOnce());
+      } catch (error) {
+        workerLogger.error('queueWorker: poll cycle failed for company', {
+          company: company.key,
+          error: error?.message || String(error),
+        });
+      }
+    }
   }
 
   function start() {
     if (pollTimer) return;
-    workerLogger.info('queueWorker: starting', { intervalMs: pollIntervalMs });
+    workerLogger.info('queueWorker: starting', {
+      intervalMs: pollIntervalMs,
+      companies: injectedSessionManager ? ['(injected)'] : listCompanies().map((c) => c.key),
+    });
     pollTimer = setInterval(() => {
-      pollOnce().catch((error) =>
+      pollOnceAllCompanies().catch((error) =>
         workerLogger.error('queueWorker: unhandled error in poll cycle', {
           error: error?.message || String(error),
         })
       );
     }, pollIntervalMs);
 
-    pollOnce().catch((error) =>
+    pollOnceAllCompanies().catch((error) =>
       workerLogger.error('queueWorker: unhandled error in initial poll', {
         error: error?.message || String(error),
       })
@@ -296,6 +409,7 @@ export function createQueueWorker({
     fetchPendingApprovalRequests,
     fetchApprovedDraftRequests,
     processApprovedDrafts,
+    retryFailedEmails,
   };
 }
 
@@ -311,13 +425,14 @@ const notifyOnNewApprovalQueued = hasEmailConfig
         approvalRequestId: item?.approvalRequestId,
         approverUserId: item?.approverUserId,
       });
+      return { skipped: true, reason: 'smtp_not_configured' };
     };
 
 export const queueWorker = createQueueWorker({
-  queueStore: postgresQueueStore,
+  queueStore: backendQueueStore,
   onNewApprovalQueued: notifyOnNewApprovalQueued,
 });
 export const { pollOnce, start, stop, fetchPendingApprovalRequests, fetchApprovedDraftRequests, processApprovedDrafts } =
   queueWorker;
-export const queueStore = postgresQueueStore;
+export const queueStore = backendQueueStore;
 export default queueWorker;

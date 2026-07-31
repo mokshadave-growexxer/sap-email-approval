@@ -1,3 +1,6 @@
 .env
 PROJECT_CONTEXT.md
+PROJECT_STATE.md
+SECURITY-AUDIT.md
 node_modules
+.cursorignore

@@ -3,12 +3,12 @@ import https from 'https';
 import { config } from '../config/index.js';
 
 class SapSessionManager {
-  constructor() {
-    this.baseUrl = config.sap.baseUrl;
-    this.username = config.sap.username;
-    this.password = config.sap.password;
-    this.companyDb = config.sap.companyDb;
-    this.renewBeforeMs = config.sap.sessionRenewBeforeMs;
+  constructor({ baseUrl, username, password, companyDb, renewBeforeMs } = {}) {
+    this.baseUrl = baseUrl ?? config.sap.baseUrl;
+    this.username = username ?? config.sap.username;
+    this.password = password ?? config.sap.password;
+    this.companyDb = companyDb ?? null;
+    this.renewBeforeMs = renewBeforeMs ?? config.sap.sessionRenewBeforeMs;
     this.cookies = new Map();
     this.lastLoginAt = null;
     this.sessionMeta = {
@@ -162,4 +162,20 @@ class SapSessionManager {
   }
 }
 
-export const sapSessionManager = new SapSessionManager();
+export { SapSessionManager };
+
+// One Service Layer session manager per CompanyDB. Sessions are company-bound,
+// so each company keeps its own login/cookies; a single process can hold several.
+const sessionManagersByCompanyDb = new Map();
+
+export function getSessionManager(companyDb) {
+  if (!companyDb) {
+    throw new Error('getSessionManager requires a companyDb');
+  }
+  let manager = sessionManagersByCompanyDb.get(companyDb);
+  if (!manager) {
+    manager = new SapSessionManager({ companyDb });
+    sessionManagersByCompanyDb.set(companyDb, manager);
+  }
+  return manager;
+}

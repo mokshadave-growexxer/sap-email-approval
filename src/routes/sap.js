@@ -1,5 +1,5 @@
 import express from 'express';
-import { sapSessionManager } from '../sap/SapSessionManager.js';
+import { currentSL } from '../services/company/companyContext.js';
 import { ApprovalService } from '../services/sap/approvalService.js';
 import { apiResponse } from '../utils/apiResponse.js';
 
@@ -7,7 +7,7 @@ const router = express.Router();
 const approvalService = new ApprovalService();
 
 async function requireSapSession() {
-  return sapSessionManager.ensureLoggedIn();
+  return currentSL().ensureLoggedIn();
 }
 
 router.get('/service-info', async (req, res, next) => {
@@ -33,7 +33,7 @@ router.get('/service-info', async (req, res, next) => {
 router.get('/approval-requests', async (req, res, next) => {
   try {
     await requireSapSession();
-    const response = await sapSessionManager.client.get(
+    const response = await currentSL().client.get(
       "/ApprovalRequests?$filter=Status%20eq%20'arsPending'%20and%20ObjectType%20eq%20'17'%20and%20IsDraft%20eq%20'Y'&$select=Code,Status,CurrentStage,ObjectType,IsDraft,ObjectEntry,DraftEntry,ApprovalRequestLines"
     );
 

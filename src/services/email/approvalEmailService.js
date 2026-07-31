@@ -1,35 +1,94 @@
 import nodemailer from 'nodemailer';
 import { config } from '../../config/index.js';
-import { generateActionTokenPair } from '../security/tokenService.js';
-import { sapSessionManager } from '../../sap/SapSessionManager.js';
+import { createProcess, getProcess, PROCESS_STATUS } from '../approval/processStore.js';
+import { hasApproverCredential } from '../security/userCredentialStore.js';
+import { getDraftAttachments } from '../sap/attachmentService.js';
+import { getSalesOrderChangeStatus } from '../sap/draftStatusService.js';
+import { currentSL, currentCompany, currentCompanyHash } from '../company/companyContext.js';
 import logger from '../../config/logger.js';
+
+// Development-only fallback so testing is not blocked if SAP /Users resolution
+// yields no UserCode. Production always resolves the UserCode from SAP.
+const DEV_TEST_APPROVER_USERCODE_MAP = Object.freeze({
+  1: 'sap01',
+  2: 'manager',
+});
+
+// While EMAIL_MODE=development, approval emails are delivered only to these
+// addresses so testing never reaches real approvers. EMAIL_MODE=production
+// lifts the guard and mails the actual approver.
+const TEST_EMAIL_ALLOWLIST = new Set(['sap1@matangiindustries.com', 'moksha.dave@growexx.com']);
+
+export function isTestAllowedRecipient(email) {
+  return TEST_EMAIL_ALLOWLIST.has(String(email || '').trim().toLowerCase());
+}
+
+/** Whether the given recipient may actually be emailed under the current EMAIL_MODE. */
+export function canDeliverToRecipient(email) {
+  return config.emailMode === 'production' || isTestAllowedRecipient(email);
+}
+
+/**
+ * Resolve the approver's SAP UserCode (login name) and email from the SAP Users
+ * entity. UserCode is what the server later logs in with; email is where the
+ * approval request is sent.
+ *
+ * @param {number|string} sapUserId - SAP UserID / InternalKey from the approval line.
+ * @returns {Promise<{userCode: string|null, email: string|null, name: string|null}>}
+ */
+async function resolveSapUser(sapUserId) {
+  try {
+    await currentSL().ensureLoggedIn();
+    const response = await currentSL().client.get(
+      `/Users(${encodeURIComponent(sapUserId)})?$select=UserCode,UserName,eMail`
+    );
+    const user = response?.data ?? response;
+    return {
+      userCode: user?.UserCode ?? null,
+      email: user?.eMail ?? null,
+      name: user?.UserName ?? null,
+    };
+  } catch (error) {
+    logger.warn('approvalEmailService: SAP /Users resolution failed', {
+      sapUserId,
+      error: error?.message || String(error),
+    });
+    return { userCode: null, email: null, name: null };
+  }
+}
 
 const DEV_TEST_APPROVER_MAP = Object.freeze({
   1: { name: 'Stage 1 Approver', email: 'sap1@matangiindustries.com' },
   2: { name: 'Stage 2 Approver', email: 'moksha.dave@growexx.com' },
 });
 
-const transporter = nodemailer.createTransport({
-  host: config.smtp.host,
-  port: config.smtp.port,
-  secure: config.smtp.port === 465,
-  auth: {
-    user: config.smtp.user,
-    pass: config.smtp.pass,
-  },
-});
+// One SMTP transport per company sender, built lazily and cached by company key.
+// Each company mails from its own configured identity (e.g. MILLP from
+// approval@matangiindustries.com, MSPL from approval@minalspecialities.com).
+const transportersByCompany = new Map();
+function getTransporter(companyKey, smtp) {
+  let transporter = transportersByCompany.get(companyKey);
+  if (!transporter) {
+    transporter = nodemailer.createTransport({
+      host: smtp.host,
+      port: smtp.port,
+      secure: smtp.port === 465,
+      auth: { user: smtp.user, pass: smtp.pass },
+    });
+    transportersByCompany.set(companyKey, transporter);
+  }
+  return transporter;
+}
 
-function assertEmailConfig() {
+function assertEmailConfig(smtp) {
   if (!config.appBaseUrl) {
     throw new Error('APP_BASE_URL is not configured.');
   }
-
-  if (!config.smtp.host) {
-    throw new Error('SMTP_HOST is not configured.');
+  if (!smtp?.host) {
+    throw new Error('SMTP host is not configured for this company.');
   }
-
-  if (!config.smtp.from) {
-    throw new Error('SMTP_FROM is not configured.');
+  if (!smtp?.from) {
+    throw new Error('SMTP from-address is not configured for this company.');
   }
 }
 
@@ -127,13 +186,36 @@ function formatSapDateTimeDisplay(updateDate, updateTime) {
   return `${date} ${time}`.trim();
 }
 
+// Payment terms are static reference data; cache the code -> name lookup so a
+// hot path (every approval email) doesn't re-query the Service Layer each time.
+const paymentTermNameCache = new Map();
+async function resolvePaymentTermName(code) {
+  if (code === undefined || code === null || code === '' || Number(code) < 0) {
+    return '';
+  }
+  const key = String(code);
+  if (paymentTermNameCache.has(key)) {
+    return paymentTermNameCache.get(key);
+  }
+  try {
+    const response = await currentSL().client.get(
+      `/PaymentTermsTypes(${encodeURIComponent(code)})?$select=PaymentTermsGroupName`
+    );
+    const name = (response?.data ?? response)?.PaymentTermsGroupName ?? '';
+    paymentTermNameCache.set(key, name);
+    return name;
+  } catch {
+    return '';
+  }
+}
+
 async function resolveDraftEmailData({ approvalRequestId, draftEntry }) {
-  await sapSessionManager.ensureLoggedIn();
+  await currentSL().ensureLoggedIn();
 
   let resolvedDraftEntry = draftEntry;
 
   if (resolvedDraftEntry === undefined || resolvedDraftEntry === null || resolvedDraftEntry === '') {
-    const approvalResponse = await sapSessionManager.client.get(
+    const approvalResponse = await currentSL().client.get(
       `/ApprovalRequests(${encodeURIComponent(approvalRequestId)})?$select=DraftEntry`
     );
     const approvalRequest = approvalResponse?.data ?? approvalResponse;
@@ -144,7 +226,7 @@ async function resolveDraftEmailData({ approvalRequestId, draftEntry }) {
     throw new Error(`Unable to resolve DraftEntry for approval request ${approvalRequestId}`);
   }
 
-  const draftResponse = await sapSessionManager.client.get(`/Drafts(${encodeURIComponent(resolvedDraftEntry)})`);
+  const draftResponse = await currentSL().client.get(`/Drafts(${encodeURIComponent(resolvedDraftEntry)})`);
   const draft = draftResponse?.data ?? draftResponse;
 
   return {
@@ -152,7 +234,9 @@ async function resolveDraftEmailData({ approvalRequestId, draftEntry }) {
     draftEntry: resolvedDraftEntry,
     cardName: draft?.CardName ?? '',
     docNum: draft?.DocNum ?? '',
-    docDueDate: draft?.DocDueDate ?? '',
+    paymentTermName: await resolvePaymentTermName(draft?.PaymentGroupCode),
+    incoterm: draft?.U_Incoterms ?? '',
+    remark: draft?.Comments ?? '',
     documentLines: normalizeArray(draft?.DocumentLines),
   };
 }
@@ -177,13 +261,12 @@ async function buildApprovalHistory(approvalRequest) {
   const history = [];
 
   for (const line of decidedLines) {
-    const contact = await resolveApproverContact({
-      approverUserId: line?.UserID,
-      approverPosition: line?.approverPosition,
-    });
+    // Show the approver by their SAP UserCode (OUSR), e.g. "Approved by manager".
+    const sapUser = await resolveSapUser(line?.UserID);
+    const displayName = sapUser.userCode || sapUser.name || `User ${line?.UserID}`;
 
     history.push({
-      name: contact.name,
+      name: displayName,
       stageCode: line?.StageCode,
       decidedAt: formatSapDateTimeDisplay(line?.UpdateDate, line?.UpdateTime),
     });
@@ -212,15 +295,26 @@ function buildApprovalHistoryHtml(history) {
     </table>`;
 }
 
+/** Small colored pill next to the email title: green "NEW SALES ORDER" or amber "UPDATED SALES ORDER". */
+function buildChangeStatusBadgeHtml(changeStatus) {
+  if (!changeStatus) return '';
+  const bg = changeStatus.code === 'CREATED' ? '#16a34a' : '#d97706';
+  return `<span style="display:inline-block; margin-left:10px; background-color:${bg}; color:#ffffff; font-size:11px; font-weight:bold; letter-spacing:0.3px; padding:3px 10px; border-radius:12px; vertical-align:middle;">${escapeHtml(
+    changeStatus.label.toUpperCase()
+  )}</span>`;
+}
+
 function buildApprovalEmailHtml({
   approverName,
-  docNum,
-  docDueDate,
   cardName,
+  paymentTermName = '',
+  incoterm = '',
+  remark = '',
   documentLines,
   approveUrl,
   rejectUrl,
   history = [],
+  changeStatus = null,
 }) {
   const lineRows = documentLines.length
     ? documentLines
@@ -229,10 +323,10 @@ function buildApprovalEmailHtml({
             <tr>
               <td style="padding:10px 12px; border-top:1px solid #e5e7eb; color:#111827; font-size:13px;">${index + 1}</td>
               <td style="padding:10px 12px; border-top:1px solid #e5e7eb; color:#111827; font-size:13px;">${escapeHtml(line?.ItemDescription ?? '')}</td>
-              <td style="padding:10px 12px; border-top:1px solid #e5e7eb; color:#111827; font-size:13px;">${escapeHtml(formatQuantity(line?.Quantity))}</td>
-              <td style="padding:10px 12px; border-top:1px solid #e5e7eb; color:#111827; font-size:13px;">${escapeHtml(line?.MeasureUnit ?? line?.UnitOfMeasurement ?? '')}</td>
-              <td style="padding:10px 12px; border-top:1px solid #e5e7eb; color:#111827; font-size:13px;">${escapeHtml(formatMoney(line?.Price ?? line?.UnitPrice))}</td>
-              <td style="padding:10px 12px; border-top:1px solid #e5e7eb; color:#111827; font-size:13px;">${escapeHtml(formatMoney(line?.LineTotal))}</td>
+              <td style="padding:10px 12px; border-top:1px solid #e5e7eb; color:#111827; font-size:13px;">${escapeHtml(line?.FreeText ?? '')}</td>
+              <td style="padding:10px 12px; border-top:1px solid #e5e7eb; color:#111827; font-size:13px; text-align:right;">${escapeHtml(formatQuantity(line?.Quantity))}</td>
+              <td style="padding:10px 12px; border-top:1px solid #e5e7eb; color:#111827; font-size:13px; text-align:right;">${escapeHtml(formatMoney(line?.Price ?? line?.UnitPrice))}</td>
+              <td style="padding:10px 12px; border-top:1px solid #e5e7eb; color:#111827; font-size:13px;">${escapeHtml(line?.Currency ?? '')}</td>
             </tr>`
         )
         .join('')
@@ -240,6 +334,11 @@ function buildApprovalEmailHtml({
             <tr>
               <td colspan="6" style="padding:12px; border-top:1px solid #e5e7eb; color:#6b7280; font-size:13px;">No draft lines found.</td>
             </tr>`;
+
+  const metaRow = (label, value) =>
+    `<tr><td style="padding:6px 16px; color:#666666; font-size:13px;">${label}</td><td style="padding:6px 16px; color:#111111; font-size:13px; font-weight:bold;">${escapeHtml(
+      value ?? ''
+    )}</td></tr>`;
 
   return `
 <!DOCTYPE html>
@@ -255,7 +354,7 @@ function buildApprovalEmailHtml({
         <table role="presentation" width="480" cellpadding="0" cellspacing="0" style="background-color:#ffffff; border-radius:8px; overflow:hidden; box-shadow:0 1px 3px rgba(0,0,0,0.1);">
           <tr>
             <td style="background-color:#1a2b4c; padding:20px 32px;">
-              <span style="color:#ffffff; font-size:18px; font-weight:bold;">Approval Required</span>
+              <span style="color:#ffffff; font-size:18px; font-weight:bold;">Approval Required</span>${buildChangeStatusBadgeHtml(changeStatus)}
             </td>
           </tr>
           <tr>
@@ -268,19 +367,20 @@ function buildApprovalEmailHtml({
               </p>
               ${buildApprovalHistoryHtml(history)}
               <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background-color:#f9fafb; border-radius:6px; padding:16px; margin-bottom:24px;">
-                <tr><td style="padding:6px 16px; color:#666666; font-size:13px;">Document No.</td><td style="padding:6px 16px; color:#111111; font-size:13px; font-weight:bold;">${escapeHtml(docNum)}</td></tr>
-                <tr><td style="padding:6px 16px; color:#666666; font-size:13px;">Customer</td><td style="padding:6px 16px; color:#111111; font-size:13px; font-weight:bold;">${escapeHtml(cardName)}</td></tr>
-                <tr><td style="padding:6px 16px; color:#666666; font-size:13px;">Due Date</td><td style="padding:6px 16px; color:#111111; font-size:13px; font-weight:bold;">${escapeHtml(docDueDate)}</td></tr>
+                ${metaRow('Customer', cardName)}
+                ${metaRow('Payment Term', paymentTermName)}
+                ${metaRow('Incoterms', incoterm)}
+                ${metaRow('Remark', remark)}
               </table>
 
               <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="border-collapse:collapse; margin-bottom:24px;">
                 <tr style="background:#1a2b4c; color:#ffffff;">
-                  <th style="text-align:left; padding:10px 12px; font-size:13px;">#</th>
-                  <th style="text-align:left; padding:10px 12px; font-size:13px;">Item Name</th>
-                  <th style="text-align:left; padding:10px 12px; font-size:13px;">Quantity</th>
-                  <th style="text-align:left; padding:10px 12px; font-size:13px;">UoM</th>
-                  <th style="text-align:left; padding:10px 12px; font-size:13px;">Rate / Unit Price</th>
-                  <th style="text-align:left; padding:10px 12px; font-size:13px;">Line Total</th>
+                  <th style="text-align:left; padding:10px 12px; font-size:13px;">Sr.No.</th>
+                  <th style="text-align:left; padding:10px 12px; font-size:13px;">Product Name</th>
+                  <th style="text-align:left; padding:10px 12px; font-size:13px;">Brand Name</th>
+                  <th style="text-align:right; padding:10px 12px; font-size:13px;">Quantity</th>
+                  <th style="text-align:right; padding:10px 12px; font-size:13px;">Price</th>
+                  <th style="text-align:left; padding:10px 12px; font-size:13px;">Currency</th>
                 </tr>
                 ${lineRows}
               </table>
@@ -317,68 +417,134 @@ function buildApprovalEmailHtml({
 `.trim();
 }
 
-export async function sendApprovalEmail({ approvalRequestId, approverUserId, approverPosition, stageId, draftEntry }) {
-  assertEmailConfig();
+export async function sendApprovalEmail({ approvalRequestId, approverUserId, approverPosition, stageId, draftEntry, processId }) {
+  const company = currentCompany();
+  const smtp = company.smtp;
+  assertEmailConfig(smtp);
   const stagePosition = approverPosition ?? stageId ?? null;
 
-  const approvalRequestResponse = await sapSessionManager.client.get(
-    `/ApprovalRequests(${encodeURIComponent(approvalRequestId)})?$select=ApprovalRequestLines`
+  const approvalRequestResponse = await currentSL().client.get(
+    `/ApprovalRequests(${encodeURIComponent(approvalRequestId)})?$select=ApprovalRequestLines,ObjectEntry`
   );
   const approvalRequest = approvalRequestResponse?.data ?? approvalRequestResponse;
   const history = await buildApprovalHistory(approvalRequest);
+  const changeStatus = getSalesOrderChangeStatus(approvalRequest);
+
+  const sapUser = await resolveSapUser(approverUserId);
+  const devUserCode =
+    process.env.NODE_ENV === 'development' ? DEV_TEST_APPROVER_USERCODE_MAP[String(stagePosition)] : undefined;
+  const userCode = sapUser.userCode ?? devUserCode ?? null;
+
+  if (!userCode) {
+    throw new Error(
+      `approvalEmailService: could not resolve SAP UserCode for approver UserID ${approverUserId} (stage ${stagePosition}).`
+    );
+  }
+
   const contact = await resolveApproverContact({
     approverUserId,
     approverPosition: stagePosition,
   });
+  const recipientEmail = sapUser.email || contact.email;
+  // Greet the approver by their SAP UserCode (OUSR), e.g. "Hi manager".
+  const approverName = userCode;
+
+  // In development mode only allowlisted test recipients are emailed; production
+  // mails the real approver (EMAIL_MODE).
+  if (!canDeliverToRecipient(recipientEmail)) {
+    logger.warn('approvalEmailService: recipient not allowed in development EMAIL_MODE — skipping send', {
+      approvalRequestId,
+      approverUserId,
+      to: recipientEmail,
+    });
+    return { skipped: true, reason: 'recipient_not_in_test_allowlist', to: recipientEmail };
+  }
+
+  if (!(await hasApproverCredential(userCode))) {
+    logger.warn('approvalEmailService: no stored SAP credential for approver; decision will fail until added', {
+      userCode,
+      approverUserId,
+    });
+  }
+
   const draftEmailData = await resolveDraftEmailData({
     approvalRequestId,
     draftEntry,
   });
 
-  const { approveToken, rejectToken } = generateActionTokenPair({
-    approvalRequestId,
-    approverUserId,
-    stageId: stagePosition,
-  });
+  // Reuse the existing link when resending a failed email; only mint a new
+  // process when there is no usable one (missing, already decided, or expired).
+  let effectiveProcessId = processId ?? null;
+  if (effectiveProcessId) {
+    const existing = await getProcess(effectiveProcessId);
+    const reusable =
+      existing && existing.status === PROCESS_STATUS.PENDING && new Date(existing.expires_at).getTime() > Date.now();
+    if (!reusable) {
+      effectiveProcessId = null;
+    }
+  }
+  if (!effectiveProcessId) {
+    const processRow = await createProcess({
+      approvalRequestId,
+      draftEntry: draftEmailData.draftEntry,
+      sapUserId: approverUserId,
+      userCode,
+      approverEmail: recipientEmail,
+      level: stagePosition,
+    });
+    effectiveProcessId = processRow.id;
+  }
 
   const baseUrl = config.appBaseUrl.replace(/\/+$/, '');
-  const approveUrl = `${baseUrl}/api/v1/approve/${approveToken}`;
-  const rejectUrl = `${baseUrl}/api/v1/reject/${rejectToken}`;
+  const companyHash = currentCompanyHash();
+  const approveUrl = `${baseUrl}/api/v1/c/${companyHash}/approve/${effectiveProcessId}`;
+  const rejectUrl = `${baseUrl}/api/v1/c/${companyHash}/reject/${effectiveProcessId}`;
 
   const html = buildApprovalEmailHtml({
-    approverName: contact.name,
-    docNum: draftEmailData.docNum,
-    docDueDate: draftEmailData.docDueDate,
+    approverName,
     cardName: draftEmailData.cardName,
+    paymentTermName: draftEmailData.paymentTermName,
+    incoterm: draftEmailData.incoterm,
+    remark: draftEmailData.remark,
     documentLines: draftEmailData.documentLines,
     approveUrl,
     rejectUrl,
     history,
+    changeStatus,
   });
+
+  // Attach the draft's uploaded files (best-effort; unreadable files are skipped).
+  const attachments = await getDraftAttachments(draftEmailData.draftEntry);
 
   logger.info('approvalEmailService: preparing to send', {
     approvalRequestId,
     approverUserId,
+    userCode,
+    processId: effectiveProcessId,
     approverPosition: stagePosition,
-    to: contact.email,
-    smtpHost: config.smtp.host,
-    smtpFrom: config.smtp.from,
+    to: recipientEmail,
+    company: company.key,
+    smtpHost: smtp.host,
+    smtpFrom: smtp.from,
     draftEntry: draftEmailData.draftEntry,
     lineCount: draftEmailData.documentLines.length,
+    attachments: attachments.length,
   });
 
   try {
-    const result = await transporter.sendMail({
-      from: config.smtp.from,
-      to: contact.email,
+    const result = await getTransporter(company.key, smtp).sendMail({
+      from: smtp.from,
+      to: recipientEmail,
       subject: `Approval Required: Sales Order ${draftEmailData.docNum}`,
       html,
+      attachments,
     });
 
     logger.info('approvalEmailService: send completed', {
       approvalRequestId,
       approverUserId,
-      to: contact.email,
+      processId: effectiveProcessId,
+      to: recipientEmail,
       draftEntry: draftEmailData.draftEntry,
       messageId: result?.messageId || null,
       accepted: result?.accepted || [],
@@ -388,14 +554,17 @@ export async function sendApprovalEmail({ approvalRequestId, approverUserId, app
     logger.error('approvalEmailService: send failed', {
       approvalRequestId,
       approverUserId,
-      to: contact.email,
+      processId: effectiveProcessId,
+      to: recipientEmail,
       draftEntry: draftEmailData.draftEntry,
       error: err.message,
     });
+    // Carry the process id so a retry reuses the same link instead of minting a new one.
+    err.processId = effectiveProcessId;
     throw err;
   }
 
-  return { approveToken, rejectToken };
+  return { processId: effectiveProcessId };
 }
 
 export { buildApprovalEmailHtml, buildApprovalHistory, buildApprovalHistoryHtml, resolveApproverContact };
