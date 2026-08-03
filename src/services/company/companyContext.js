@@ -30,6 +30,7 @@ for (const c of config.companies) {
     schema: c.schema,
     companyDb: c.companyDb,
     smtp: c.smtp,
+    minRequestId: c.minRequestId ?? null,
     hash: hashSchema(c.schema),
   });
   byKey.set(entry.key, entry);

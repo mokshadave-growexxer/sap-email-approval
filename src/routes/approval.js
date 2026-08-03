@@ -6,7 +6,6 @@ import {
   consumeFootprintSession,
   getClientIp,
 } from '../services/security/footprintService.js';
-import { getApproverPassword, UnknownApproverError } from '../services/security/userCredentialStore.js';
 import {
   PROCESS_FAILURE,
   PROCESS_STATUS,
@@ -68,7 +67,9 @@ function renderDecisionPage({ action, process, processId, companyHash, errorMess
     .meta { background:#f9fafb; border-radius: 8px; padding: 14px 16px; margin: 18px 0; }
     .meta div { display:flex; justify-content:space-between; gap:16px; padding: 5px 0; font-size: 14px; }
     label { display:block; font-weight:700; margin: 14px 0 8px; font-size:14px; }
-    textarea { width:100%; box-sizing:border-box; border:1px solid #d1d5db; border-radius:8px; padding:12px 14px; font-size:14px; min-height:84px; resize:vertical; }
+    textarea, input[type="password"], input[type="text"] { width:100%; box-sizing:border-box; border:1px solid #d1d5db; border-radius:8px; padding:12px 14px; font-size:14px; }
+    textarea { min-height:84px; resize:vertical; }
+    input[readonly] { background:#f3f4f6; color:#374151; cursor:not-allowed; }
     .status { display:flex; align-items:center; gap:10px; margin: 18px 0; padding:12px 14px; border-radius:8px; background:#f3f4f6; color:#374151; font-size:14px; }
     .status.ok { background:#ecfdf5; color:#065f46; }
     .status.err { background:#fef2f2; color:#991b1b; }
@@ -95,8 +96,14 @@ function renderDecisionPage({ action, process, processId, companyHash, errorMess
 
         ${errorMessage ? `<div class="status err">${escapeHtml(errorMessage)}</div>` : ''}
 
-        <form method="post" action="/api/v1/c/${escapeHtml(companyHash)}/${escapeHtml(action)}/${escapeHtml(processId)}" data-process-id="${escapeHtml(processId)}" data-register-url="/api/v1/c/${escapeHtml(companyHash)}/footprint/register">
+        <form method="post" action="/api/v1/c/${escapeHtml(companyHash)}/${escapeHtml(action)}/${escapeHtml(processId)}" data-process-id="${escapeHtml(processId)}" data-register-url="/api/v1/c/${escapeHtml(companyHash)}/footprint/register" autocomplete="off">
           <input type="hidden" id="session_id" name="session_id" value="" />
+
+          <label for="sap_user">SAP User ID</label>
+          <input type="text" id="sap_user" value="${escapeHtml(process?.user_code)}" readonly tabindex="-1" aria-readonly="true" />
+
+          <label for="sap_password">Please enter your SAP password</label>
+          <input type="password" id="sap_password" name="sap_password" autocomplete="off" autocapitalize="off" spellcheck="false" required placeholder="Your SAP password" />
 
           <label for="remarks">Remarks (optional)</label>
           <textarea id="remarks" name="remarks" placeholder="Add a note for the audit trail..."></textarea>
@@ -110,7 +117,7 @@ function renderDecisionPage({ action, process, processId, companyHash, errorMess
         </form>
 
         <div class="small">
-          No SAP password is required — your identity is verified from your registered profile and device fingerprint. This link works once and expires automatically.
+          Enter your SAP password to authorize this decision — it is verified directly by SAP and is never stored. Your device fingerprint is recorded for the audit trail. This link works once and expires automatically.
         </div>
       </div>
     </div>
@@ -151,15 +158,10 @@ function renderResultPage({ title, message, details = '' }) {
 }
 
 function toHumanMessage(error) {
-  if (error instanceof ApprovalUnauthorizedError) return 'You are not authorized to do this action.';
-  if (error instanceof UnknownApproverError) {
-    return 'Your SAP profile is not enrolled for one-click approval. Please contact your SAP administrator.';
-  }
+  if (error instanceof ApprovalUnauthorizedError) return 'You are not authorized to approve or reject this request.';
   if (error instanceof ApprovalSapError && error.meta?.friendlyMessage) return error.meta.friendlyMessage;
-  if (error instanceof ApprovalSapError && error.meta?.cause) {
-    return `${error.message} | SAP detail: ${typeof error.meta.cause === 'string' ? error.meta.cause : JSON.stringify(error.meta.cause)}`;
-  }
-  return error?.message || 'Unexpected error';
+  // Never surface raw SAP/internal error detail to the browser.
+  return 'Your SAP password could not be verified, or the decision could not be completed. Please check your password and try again.';
 }
 
 const FAILURE_MESSAGES = Object.freeze({
@@ -192,6 +194,8 @@ function buildSapResponseForLog(error) {
 }
 
 async function handleDecision(req, res, action) {
+  // The decision page carries a SAP password field — never let it be cached.
+  res.set('Cache-Control', 'no-store');
   const { processId } = req.params;
   const process = await getProcess(processId);
 
@@ -290,19 +294,22 @@ async function handleDecisionPost(req, res, action, processId, process) {
     linkExpiry,
   });
 
-  let approverPassword;
-  try {
-    approverPassword = await getApproverPassword(process.user_code);
-  } catch (error) {
+  // The approver's SAP password is typed on the decision page and used only to
+  // authenticate this one decision against SAP. It is never stored, never
+  // logged, and never echoed back. `sapPassword` is intentionally NOT spread
+  // into any log object below.
+  const sapPassword = req.body?.sap_password || '';
+  if (!sapPassword) {
     await releaseProcess(processId);
-    await markDecisionFailed(decisionLogId, error?.message || String(error));
-    logger.error('approval route: credential resolution failed', {
-      processId,
-      userCode: process.user_code,
-      error: error?.message || String(error),
-    });
-    return res.status(403).send(
-      renderResultPage({ title: 'Not Enrolled', message: toHumanMessage(error) })
+    await markDecisionFailed(decisionLogId, 'sap_password_missing');
+    return res.status(400).send(
+      renderDecisionPage({
+        action,
+        process,
+        processId,
+        companyHash: currentCompanyHash(),
+        errorMessage: 'Please enter your SAP password.',
+      })
     );
   }
 
@@ -312,7 +319,7 @@ async function handleDecisionPost(req, res, action, processId, process) {
       approvalRequestId: process.approval_request_id,
       approverUserId: process.sap_user_id,
       approverUsername: process.user_code,
-      approverPassword,
+      approverPassword: sapPassword,
       remarks: req.body?.remarks || '',
     };
 

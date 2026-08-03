@@ -1,7 +1,6 @@
 import nodemailer from 'nodemailer';
 import { config } from '../../config/index.js';
 import { createProcess, getProcess, PROCESS_STATUS } from '../approval/processStore.js';
-import { hasApproverCredential } from '../security/userCredentialStore.js';
 import { getDraftAttachments } from '../sap/attachmentService.js';
 import { getSalesOrderChangeStatus } from '../sap/draftStatusService.js';
 import { currentSL, currentCompany, currentCompanyHash } from '../company/companyContext.js';
@@ -305,7 +304,6 @@ function buildChangeStatusBadgeHtml(changeStatus) {
 }
 
 function buildApprovalEmailHtml({
-  approverName,
   cardName,
   paymentTermName = '',
   incoterm = '',
@@ -360,7 +358,7 @@ function buildApprovalEmailHtml({
           <tr>
             <td style="padding:28px 32px 8px 32px;">
               <p style="margin:0 0 16px 0; color:#333333; font-size:15px;">
-                Hi ${escapeHtml(approverName)},
+                Hi,
               </p>
               <p style="margin:0 0 20px 0; color:#333333; font-size:15px;">
                 A Sales Order draft is waiting for your approval.
@@ -446,8 +444,6 @@ export async function sendApprovalEmail({ approvalRequestId, approverUserId, app
     approverPosition: stagePosition,
   });
   const recipientEmail = sapUser.email || contact.email;
-  // Greet the approver by their SAP UserCode (OUSR), e.g. "Hi manager".
-  const approverName = userCode;
 
   // In development mode only allowlisted test recipients are emailed; production
   // mails the real approver (EMAIL_MODE).
@@ -458,13 +454,6 @@ export async function sendApprovalEmail({ approvalRequestId, approverUserId, app
       to: recipientEmail,
     });
     return { skipped: true, reason: 'recipient_not_in_test_allowlist', to: recipientEmail };
-  }
-
-  if (!(await hasApproverCredential(userCode))) {
-    logger.warn('approvalEmailService: no stored SAP credential for approver; decision will fail until added', {
-      userCode,
-      approverUserId,
-    });
   }
 
   const draftEmailData = await resolveDraftEmailData({
@@ -501,7 +490,6 @@ export async function sendApprovalEmail({ approvalRequestId, approverUserId, app
   const rejectUrl = `${baseUrl}/api/v1/c/${companyHash}/reject/${effectiveProcessId}`;
 
   const html = buildApprovalEmailHtml({
-    approverName,
     cardName: draftEmailData.cardName,
     paymentTermName: draftEmailData.paymentTermName,
     incoterm: draftEmailData.incoterm,

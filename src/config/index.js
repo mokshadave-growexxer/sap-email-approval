@@ -83,7 +83,8 @@ const env = validateEnv([
   { key: 'APP_NAME', default: 'sap-email-approval' },
   { key: 'JWT_SECRET' },
   { key: 'JWT_EXPIRES_IN', default: '15m' },
-  { key: 'CREDENTIALS_ENC_KEY' },
+  { key: 'TLS_KEY_PATH', default: '' },
+  { key: 'TLS_CERT_PATH', default: '' },
   { key: 'APPROVAL_LINK_TTL_HOURS', parse: 'int', default: 72 },
   { key: 'FOOTPRINT_GEO_OPTIONAL', default: 'false', allowed: ['true', 'false'] },
   { key: 'HANA_HOST' },
@@ -118,10 +119,25 @@ const globalSmtp = {
   from: env.SMTP_FROM,
 };
 
+// Optional per-company backlog cutoff: only SAP approval requests whose id
+// (WddCode) is greater than this are ever emailed. Set APPROVAL_MIN_REQUEST_ID_<KEY>
+// to freeze out the existing pending backlog permanently (survives restarts). If
+// unset, the queue worker captures a baseline once at startup instead.
+export function resolveMinRequestId(key, envSource = process.env) {
+  const raw = envSource[`APPROVAL_MIN_REQUEST_ID_${String(key).toUpperCase()}`];
+  if (raw == null || raw === '') return null;
+  const n = Number.parseInt(raw, 10);
+  return Number.isFinite(n) ? n : null;
+}
+
 const companies = parseCompanies(env.SAP_COMPANIES, {
   fallbackSchema: env.HANA_SCHEMA,
   fallbackCompanyDb: env.SAP_COMPANY_DB,
-}).map((c) => ({ ...c, smtp: resolveCompanySmtp(c.key, globalSmtp) }));
+}).map((c) => ({
+  ...c,
+  smtp: resolveCompanySmtp(c.key, globalSmtp),
+  minRequestId: resolveMinRequestId(c.key),
+}));
 
 export const config = {
   nodeEnv: env.NODE_ENV,
@@ -130,7 +146,7 @@ export const config = {
   appBaseUrl: env.APP_BASE_URL,
   jwtSecret: env.JWT_SECRET,
   jwtExpiresIn: env.JWT_EXPIRES_IN,
-  credentialsEncKey: env.CREDENTIALS_ENC_KEY,
+  tls: { keyPath: env.TLS_KEY_PATH, certPath: env.TLS_CERT_PATH },
   approvalLinkTtlHours: env.APPROVAL_LINK_TTL_HOURS,
   footprintGeoOptional: env.FOOTPRINT_GEO_OPTIONAL === 'true',
   emailMode: env.EMAIL_MODE,

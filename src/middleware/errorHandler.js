@@ -9,14 +9,14 @@ export const errorHandler = (err, req, res, next) => {
     statusCode,
   });
 
+  // NEVER log req.body/req.query — request bodies can contain the approver's SAP
+  // password and other secrets. Log only non-sensitive request metadata.
   logger.error('Unhandled error caught by middleware', {
     message: err.message,
     statusCode,
     stack: err.stack,
-    route: req.originalUrl,
+    route: req.path,
     method: req.method,
-    body: req.body,
-    query: req.query,
   });
 
   if (res.headersSent) {

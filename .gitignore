@@ -4,3 +4,4 @@ PROJECT_STATE.md
 SECURITY-AUDIT.md
 node_modules
 .cursorignore
+certs

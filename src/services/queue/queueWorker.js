@@ -1,5 +1,5 @@
 import logger from '../../config/logger.js';
-import { listCompanies, runInCompany, currentSL } from '../company/companyContext.js';
+import { listCompanies, runInCompany, currentSL, currentCompany } from '../company/companyContext.js';
 import { queueStore as backendQueueStore } from './queueStore.js';
 import { sendApprovalEmail } from '../email/approvalEmailService.js';
 import { postApprovedDraft } from '../sap/approvalService.js';
@@ -94,6 +94,7 @@ export function createQueueWorker({
   pollIntervalMs = POLL_INTERVAL_MS,
   emailMaxSendAttempts = EMAIL_MAX_SEND_ATTEMPTS,
   emailRetryBackoffMinutes = EMAIL_RETRY_BACKOFF_MINUTES,
+  resolveBaselineFn = null,
 } = {}) {
   let pollTimer = null;
   /** @type {Set<string>} Drafts successfully posted in this process (avoid re-POSTing every poll). Keyed by company. */
@@ -102,16 +103,45 @@ export function createQueueWorker({
   // The active company's Service Layer session, unless one was injected (tests).
   const resolveSession = () => injectedSessionManager ?? currentSL();
 
+  // Backlog cutoff: by default every pending request is emailed. Set a per-company
+  // APPROVAL_MIN_REQUEST_ID_<KEY> to permanently skip an older backlog — only
+  // requests with WddCode > that value are then emailed. This is an explicit,
+  // restart-stable cutoff (never auto-captured, so a restart can't freeze out
+  // legitimate pending Sales Orders).
+  function defaultResolveBaseline() {
+    if (injectedSessionManager) return -Infinity; // injected tests: no company context
+    return currentCompany().minRequestId ?? -Infinity;
+  }
+  const resolveBaseline = resolveBaselineFn ?? defaultResolveBaseline;
+
+  // The SAP Service Layer paginates OData results (default 20 per page). Follow
+  // @odata.nextLink so EVERY pending request is fetched, not just the first page
+  // — otherwise, with a backlog larger than one page, the newest requests never
+  // surface until older ones are cleared (they appear to trickle in one by one).
+  async function getAllPages(firstPath) {
+    const all = [];
+    let path = firstPath;
+    let guard = 0;
+    while (path && guard < 500) {
+      guard += 1;
+      const response = await resolveSession().client.get(path);
+      const data = response?.data ?? response ?? {};
+      const page = Array.isArray(data) ? data : data.value ?? [];
+      all.push(...page);
+      const next = data['@odata.nextLink'] ?? data['odata.nextLink'] ?? null;
+      if (!next) break;
+      path = /^https?:\/\//i.test(next) ? next : `/${String(next).replace(/^\/+/, '')}`;
+    }
+    return all;
+  }
+
   async function fetchPendingApprovalRequests() {
     await resolveSession().ensureLoggedIn();
 
     try {
       workerLogger.info('queueWorker: polling SAP approval requests');
-      const response = await resolveSession().client.get(PENDING_APPROVALS_PATH);
-      const pending = normalizeApprovalList(response);
-      workerLogger.info('queueWorker: SAP poll completed', {
-        count: Array.isArray(pending) ? pending.length : 0,
-      });
+      const pending = await getAllPages(PENDING_APPROVALS_PATH);
+      workerLogger.info('queueWorker: SAP poll completed', { count: pending.length });
       return pending;
     } catch (error) {
       workerLogger.error('queueWorker: SAP request failed', {
@@ -127,11 +157,8 @@ export function createQueueWorker({
 
     try {
       workerLogger.info('queueWorker: polling SAP approved draft requests');
-      const response = await resolveSession().client.get(APPROVED_DRAFTS_PATH);
-      const approved = normalizeApprovalList(response);
-      workerLogger.info('queueWorker: approved draft poll completed', {
-        count: Array.isArray(approved) ? approved.length : 0,
-      });
+      const approved = await getAllPages(APPROVED_DRAFTS_PATH);
+      workerLogger.info('queueWorker: approved draft poll completed', { count: approved.length });
       return approved;
     } catch (error) {
       workerLogger.error('queueWorker: approved draft SAP request failed', {
@@ -218,15 +245,20 @@ export function createQueueWorker({
       return;
     }
 
+    const baseline = resolveBaseline(pendingRequests);
     const known = new Set([...(await queueStore.getKnownApprovalStageKeys())].map((value) => String(value)));
     workerLogger.info('queueWorker: processing pending approvals', {
       pendingCount: pendingRequests.length,
       knownCount: known.size,
+      baseline,
     });
 
     for (const req of pendingRequests) {
       const approvalRequestId = req.Code ?? req.Id ?? req.approvalRequestId;
       const currentStage = req.CurrentStage ?? req.currentStage;
+
+      // Skip the pre-existing backlog — only requests newer than the cutoff.
+      if (Number(approvalRequestId) <= baseline) continue;
 
       const actionable = getActionableApprovers(req);
       if (actionable.length === 0) continue;
