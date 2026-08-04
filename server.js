@@ -1,6 +1,4 @@
-import fs from 'node:fs';
 import http from 'node:http';
-import https from 'node:https';
 import app from './src/app.js';
 import { config } from './src/config/index.js';
 import logger from './src/config/logger.js';
@@ -16,39 +14,32 @@ process.on('uncaughtException', (error) => {
 
 let server;
 
-// HTTPS when a TLS key + cert are configured (required in production so the
-// approver's SAP password is never sent in clear text); plain HTTP otherwise
-// (local development only).
-function createServer() {
-  const { keyPath, certPath } = config.tls;
-  if (keyPath && certPath) {
-    const options = { key: fs.readFileSync(keyPath), cert: fs.readFileSync(certPath) };
-    logger.info('Starting HTTPS server (TLS enabled)');
-    return https.createServer(options, app);
-  }
-  logger.warn('TLS_KEY_PATH/TLS_CERT_PATH not set — starting plain HTTP (development only; do NOT use in production)');
-  return http.createServer(app);
-}
+// Plain HTTP only. HTTPS/TLS is terminated by the hosting front end (IIS), which
+// binds the certificate and forwards requests here. `app` sets `trust proxy`, so
+// the real client IP is read from the proxy's X-Forwarded-For header.
+const startServer = () => {
+  server = http.createServer(app);
 
-const startServer = (port) => {
-  server = createServer();
-  // Bind to config.host (default 0.0.0.0) so the service is reachable from other
-  // machines on the network by the server's IP, not just localhost.
-  server.listen(port, config.host, () => {
-    logger.info(`Server listening on ${config.host}:${port}`);
+  // iisnode supplies a named pipe in process.env.PORT; a standalone/reverse-proxy
+  // deployment supplies a numeric port (bound to config.host).
+  const target = process.env.PORT || config.port || 3000;
+  const numericPort = Number(target);
+  const isNamedPipe = Number.isNaN(numericPort);
+
+  const onListening = () => {
+    logger.info(`Server listening on ${isNamedPipe ? String(target) : `${config.host}:${numericPort}`}`);
     logger.info(`Environment: ${config.nodeEnv}`);
-  });
+  };
+
+  if (isNamedPipe) {
+    server.listen(target, onListening);
+  } else {
+    server.listen(numericPort, config.host, onListening);
+  }
 
   queueWorker.start();
 
   server.on('error', (error) => {
-    if (error.code === 'EADDRINUSE') {
-      logger.warn(`Port ${port} is already in use, trying ${port + 1}`);
-      queueWorker.stop();
-      startServer(port + 1);
-      return;
-    }
-
     logger.error('Server failed to start', {
       message: error.message,
       stack: error.stack,
@@ -57,7 +48,7 @@ const startServer = (port) => {
   });
 };
 
-startServer(Number(process.env.PORT || config.port || 3000));
+startServer();
 
 process.on('SIGINT', () => {
   queueWorker.stop();
