@@ -80,6 +80,7 @@ export function resolveCompanySmtp(key, globalSmtp, envSource = process.env) {
 const env = validateEnv([
   { key: 'NODE_ENV', allowed: ['development', 'production', 'test'], default: 'development' },
   { key: 'PORT', parse: 'int', default: 3000 },
+  { key: 'HOST', default: '0.0.0.0' },
   { key: 'APP_NAME', default: 'sap-email-approval' },
   { key: 'JWT_SECRET' },
   { key: 'JWT_EXPIRES_IN', default: '15m' },
@@ -142,6 +143,7 @@ const companies = parseCompanies(env.SAP_COMPANIES, {
 export const config = {
   nodeEnv: env.NODE_ENV,
   port: env.PORT,
+  host: env.HOST,
   appName: env.APP_NAME,
   appBaseUrl: env.APP_BASE_URL,
   jwtSecret: env.JWT_SECRET,

@@ -32,8 +32,10 @@ function createServer() {
 
 const startServer = (port) => {
   server = createServer();
-  server.listen(port, () => {
-    logger.info(`Server listening on port ${port}`);
+  // Bind to config.host (default 0.0.0.0) so the service is reachable from other
+  // machines on the network by the server's IP, not just localhost.
+  server.listen(port, config.host, () => {
+    logger.info(`Server listening on ${config.host}:${port}`);
     logger.info(`Environment: ${config.nodeEnv}`);
   });
 
