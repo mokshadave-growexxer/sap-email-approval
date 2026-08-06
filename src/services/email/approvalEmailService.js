@@ -309,8 +309,7 @@ function buildApprovalEmailHtml({
   incoterm = '',
   remark = '',
   documentLines,
-  approveUrl,
-  rejectUrl,
+  actionUrl,
   history = [],
   changeStatus = null,
 }) {
@@ -389,11 +388,8 @@ function buildApprovalEmailHtml({
             <td style="padding:0 32px 32px 32px;" align="center">
               <table role="presentation" cellpadding="0" cellspacing="0">
                 <tr>
-                  <td style="padding-right:10px;">
-                    <a href="${approveUrl}" style="display:inline-block; background-color:#1a7f37; color:#ffffff; text-decoration:none; font-size:14px; font-weight:bold; padding:12px 28px; border-radius:6px;">Approve</a>
-                  </td>
                   <td>
-                    <a href="${rejectUrl}" style="display:inline-block; background-color:#b42318; color:#ffffff; text-decoration:none; font-size:14px; font-weight:bold; padding:12px 28px; border-radius:6px;">Reject</a>
+                    <a href="${actionUrl}" style="display:inline-block; background-color:#1a2b4c; color:#ffffff; text-decoration:none; font-size:15px; font-weight:bold; padding:14px 36px; border-radius:6px;">Take Action</a>
                   </td>
                 </tr>
               </table>
@@ -486,8 +482,7 @@ export async function sendApprovalEmail({ approvalRequestId, approverUserId, app
 
   const baseUrl = config.appBaseUrl.replace(/\/+$/, '');
   const companyHash = currentCompanyHash();
-  const approveUrl = `${baseUrl}/api/v1/c/${companyHash}/approve/${effectiveProcessId}`;
-  const rejectUrl = `${baseUrl}/api/v1/c/${companyHash}/reject/${effectiveProcessId}`;
+  const actionUrl = `${baseUrl}/api/v1/c/${companyHash}/action/${effectiveProcessId}`;
 
   const html = buildApprovalEmailHtml({
     cardName: draftEmailData.cardName,
@@ -495,8 +490,7 @@ export async function sendApprovalEmail({ approvalRequestId, approverUserId, app
     incoterm: draftEmailData.incoterm,
     remark: draftEmailData.remark,
     documentLines: draftEmailData.documentLines,
-    approveUrl,
-    rejectUrl,
+    actionUrl,
     history,
     changeStatus,
   });

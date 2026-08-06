@@ -12,11 +12,15 @@ export const FOOTPRINT_CLIENT_JS = `(function () {
     var statusText = document.getElementById('geo-text');
     var spinner = statusBox ? statusBox.querySelector('.spinner') : null;
     var retry = document.getElementById('geo-retry');
-    var submitBtn = document.getElementById('decision-submit');
+    var decisionBtns = form.querySelectorAll('.decision-btn');
     var sessionInput = document.getElementById('session_id');
     var settled = false;
 
     if (retry) retry.addEventListener('click', function () { location.reload(); });
+
+    function setDecisionsEnabled(enabled) {
+      for (var i = 0; i < decisionBtns.length; i++) decisionBtns[i].disabled = !enabled;
+    }
 
     function setStatus(text, kind) {
       if (statusText) statusText.textContent = text;
@@ -50,17 +54,17 @@ export const FOOTPRINT_CLIENT_JS = `(function () {
     function applyResult(res, okMsg, blockedMsg) {
       if (res && res.session_id) {
         sessionInput.value = res.session_id;
-        submitBtn.disabled = false;
+        setDecisionsEnabled(true);
         setStatus(okMsg, 'ok');
       } else {
-        submitBtn.disabled = true;
+        setDecisionsEnabled(false);
         setStatus(blockedMsg, 'err');
         if (retry) retry.style.display = 'inline-block';
       }
     }
 
     function fail(msg) {
-      submitBtn.disabled = true;
+      setDecisionsEnabled(false);
       setStatus(msg, 'err');
       if (retry) retry.style.display = 'inline-block';
     }

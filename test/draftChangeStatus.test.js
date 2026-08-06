@@ -25,8 +25,7 @@ function baseArgs(overrides = {}) {
     documentLines: [
       { ItemDescription: 'C12-C16 alcohol ethoxylate', FreeText: 'Croda', Quantity: 10000, Price: 21.12, Currency: 'INR' },
     ],
-    approveUrl: 'http://x/approve',
-    rejectUrl: 'http://x/reject',
+    actionUrl: 'http://x/action',
     history: [],
     ...overrides,
   };

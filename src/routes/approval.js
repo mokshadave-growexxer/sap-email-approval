@@ -40,14 +40,8 @@ function escapeHtml(value) {
     .replace(/"/g, '&quot;');
 }
 
-function renderDecisionPage({ action, process, processId, companyHash, errorMessage = '' }) {
-  const title = action === ACTIONS.APPROVE ? 'Approve Request' : 'Reject Request';
-  const question =
-    action === ACTIONS.APPROVE
-      ? 'Are you sure you want to approve this Sales Order?'
-      : 'Are you sure you want to reject this Sales Order?';
-  const buttonLabel = action === ACTIONS.APPROVE ? 'Yes, Approve' : 'Yes, Reject';
-  const buttonColor = action === ACTIONS.APPROVE ? '#1a7f37' : '#b42318';
+function renderDecisionPage({ process, processId, companyHash, errorMessage = '' }) {
+  const title = 'Approval Decision';
   const approvalRequestId = escapeHtml(process?.approval_request_id);
   const level = escapeHtml(process?.level);
 
@@ -78,7 +72,8 @@ function renderDecisionPage({ action, process, processId, companyHash, errorMess
     .actions { margin-top: 8px; display:flex; gap:12px; flex-wrap:wrap; align-items:center; }
     button { border:0; border-radius:8px; padding:13px 22px; font-size:15px; font-weight:700; color:#fff; cursor:pointer; }
     button[disabled] { opacity:.45; cursor:not-allowed; }
-    .secondary { background:#6b7280; text-decoration:none; display:inline-flex; align-items:center; padding:13px 20px; border-radius:8px; color:#fff; font-size:15px; font-weight:700; }
+    .approve { background:#1a7f37; }
+    .reject { background:#b42318; }
     #geo-retry { background:#374151; display:none; }
     .small { color:#6b7280; font-size:12px; margin-top: 16px; line-height:1.5; }
   </style>
@@ -88,7 +83,7 @@ function renderDecisionPage({ action, process, processId, companyHash, errorMess
     <div class="card">
       <div class="head">${escapeHtml(title)}</div>
       <div class="body">
-        <p class="q">${escapeHtml(question)}</p>
+        <p class="q">Review this Sales Order, then Approve or Reject.</p>
         <div class="meta">
           <div><span>Approval Request</span><strong>${approvalRequestId}</strong></div>
           <div><span>Approval Level</span><strong>${level}</strong></div>
@@ -96,7 +91,7 @@ function renderDecisionPage({ action, process, processId, companyHash, errorMess
 
         ${errorMessage ? `<div class="status err">${escapeHtml(errorMessage)}</div>` : ''}
 
-        <form method="post" action="/api/v1/c/${escapeHtml(companyHash)}/${escapeHtml(action)}/${escapeHtml(processId)}" data-process-id="${escapeHtml(processId)}" data-register-url="/api/v1/c/${escapeHtml(companyHash)}/footprint/register" autocomplete="off">
+        <form method="post" action="/api/v1/c/${escapeHtml(companyHash)}/action/${escapeHtml(processId)}" data-process-id="${escapeHtml(processId)}" data-register-url="/api/v1/c/${escapeHtml(companyHash)}/footprint/register" autocomplete="off">
           <input type="hidden" id="session_id" name="session_id" value="" />
 
           <label for="sap_user">SAP User ID</label>
@@ -111,13 +106,14 @@ function renderDecisionPage({ action, process, processId, companyHash, errorMess
           <div id="geo-status" class="status"><span class="spinner"></span><span id="geo-text">Verifying your device and location…</span></div>
 
           <div class="actions">
-            <button id="decision-submit" type="submit" style="background:${buttonColor};" disabled>${escapeHtml(buttonLabel)}</button>
+            <button class="decision-btn approve" type="submit" name="decision" value="approve" disabled>Approve</button>
+            <button class="decision-btn reject" type="submit" name="decision" value="reject" disabled>Reject</button>
             <button id="geo-retry" type="button">Retry</button>
           </div>
         </form>
 
         <div class="small">
-          Enter your SAP password to authorize this decision — it is verified directly by SAP and is never stored. Your device fingerprint is recorded for the audit trail. This link works once and expires automatically.
+          Enter your SAP password, then choose Approve or Reject. The password is verified directly by SAP and is never stored. Your device fingerprint is recorded for the audit trail. This link works once and expires automatically.
         </div>
       </div>
     </div>
@@ -193,7 +189,7 @@ function buildSapResponseForLog(error) {
   return { message: error?.message || String(error) };
 }
 
-async function handleDecision(req, res, action) {
+async function handleAction(req, res) {
   // The decision page carries a SAP password field — never let it be cached.
   res.set('Cache-Control', 'no-store');
   const { processId } = req.params;
@@ -225,7 +221,21 @@ async function handleDecision(req, res, action) {
   }
 
   if (req.method === 'GET') {
-    return res.status(200).send(renderDecisionPage({ action, process, processId, companyHash: currentCompanyHash() }));
+    return res.status(200).send(renderDecisionPage({ process, processId, companyHash: currentCompanyHash() }));
+  }
+
+  // The chosen action comes from which button was clicked (decision = approve|reject).
+  const decision = req.body?.decision;
+  const action = decision === ACTIONS.APPROVE || decision === ACTIONS.REJECT ? decision : null;
+  if (!action) {
+    return res.status(400).send(
+      renderDecisionPage({
+        process,
+        processId,
+        companyHash: currentCompanyHash(),
+        errorMessage: 'Please choose Approve or Reject.',
+      })
+    );
   }
 
   return handleDecisionPost(req, res, action, processId, process);
@@ -304,7 +314,6 @@ async function handleDecisionPost(req, res, action, processId, process) {
     await markDecisionFailed(decisionLogId, 'sap_password_missing');
     return res.status(400).send(
       renderDecisionPage({
-        action,
         process,
         processId,
         companyHash: currentCompanyHash(),
@@ -342,7 +351,7 @@ async function handleDecisionPost(req, res, action, processId, process) {
 
     const status = error instanceof ApprovalUnauthorizedError ? 403 : 400;
     return res.status(status).send(
-      renderDecisionPage({ action, process, processId, companyHash: currentCompanyHash(), errorMessage: toHumanMessage(error) })
+      renderDecisionPage({ process, processId, companyHash: currentCompanyHash(), errorMessage: toHumanMessage(error) })
     );
   }
 
@@ -427,9 +436,9 @@ async function handleDecisionPost(req, res, action, processId, process) {
   );
 }
 
-router.get('/approve/:processId', (req, res) => handleDecision(req, res, ACTIONS.APPROVE));
-router.get('/reject/:processId', (req, res) => handleDecision(req, res, ACTIONS.REJECT));
-router.post('/approve/:processId', (req, res) => handleDecision(req, res, ACTIONS.APPROVE));
-router.post('/reject/:processId', (req, res) => handleDecision(req, res, ACTIONS.REJECT));
+// Single "Take Action" entry point: GET renders the page (Approve + Reject
+// buttons); POST carries the chosen decision (approve|reject) from the button.
+router.get('/action/:processId', (req, res) => handleAction(req, res));
+router.post('/action/:processId', (req, res) => handleAction(req, res));
 
 export default router;
