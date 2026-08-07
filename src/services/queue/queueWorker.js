@@ -2,7 +2,7 @@ import logger from '../../config/logger.js';
 import { listCompanies, runInCompany, currentSL, currentCompany } from '../company/companyContext.js';
 import { queueStore as backendQueueStore } from './queueStore.js';
 import { sendApprovalEmail } from '../email/approvalEmailService.js';
-import { postApprovedDraft } from '../sap/approvalService.js';
+import { LINE_STATUS, postApprovedDraft } from '../sap/approvalService.js';
 
 const POLL_INTERVAL_MS = 30_000;
 const EMAIL_MAX_SEND_ATTEMPTS = 5;
@@ -45,14 +45,14 @@ export function getActionableApprovers(approvalRequest) {
       continue;
     }
 
-    if (line.Status !== 'ardPending') {
+    if (line.Status !== LINE_STATUS.PENDING) {
       continue;
     }
 
     const priorPending = lines.slice(0, index).some(
       (previousLine) =>
         Number(previousLine.StageCode) === Number(approvalRequest.CurrentStage) &&
-        previousLine.Status === 'ardPending'
+        previousLine.Status === LINE_STATUS.PENDING
     );
 
     if (priorPending) {

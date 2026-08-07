@@ -5,3 +5,4 @@ SECURITY-AUDIT.md
 node_modules
 .cursorignore
 certs
+session-backup.md

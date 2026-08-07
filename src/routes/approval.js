@@ -1,6 +1,11 @@
 import express from 'express';
 import logger from '../config/logger.js';
-import { ApprovalService, ApprovalSapError, ApprovalUnauthorizedError } from '../services/sap/approvalService.js';
+import {
+  ApprovalService,
+  ApprovalSapError,
+  ApprovalStageAdvancedError,
+  ApprovalUnauthorizedError,
+} from '../services/sap/approvalService.js';
 import {
   GATE_FAILURE,
   consumeFootprintSession,
@@ -13,6 +18,7 @@ import {
   expireProcess,
   getProcess,
   markProcessDecided,
+  markProcessSuperseded,
   releaseProcess,
 } from '../services/approval/processStore.js';
 import {
@@ -189,6 +195,31 @@ function buildSapResponseForLog(error) {
   return { message: error?.message || String(error) };
 }
 
+const ALREADY_DECIDED_PAGE = Object.freeze({
+  title: 'Already Decided',
+  message: 'This request has already been decided in SAP. No further action is needed.',
+});
+
+// Ask SAP (the source of truth) whether this approver may still act on the exact
+// stage this link was issued for. A decision taken in the SAP add-on retires the
+// link here even though this service never processed it. Best-effort: a failed
+// SAP read defers to the authoritative guard inside ApprovalService._decide.
+async function confirmStillActionableInSap(process) {
+  try {
+    return await approvalService.getDecisionEligibility({
+      approvalRequestId: process.approval_request_id,
+      approverUserId: process.sap_user_id,
+      stage: process.stage,
+    });
+  } catch (error) {
+    logger.warn('approval route: SAP eligibility check failed; deferring to decision-time guard', {
+      processId: process.id,
+      error: error?.message || String(error),
+    });
+    return null;
+  }
+}
+
 async function handleAction(req, res) {
   // The decision page carries a SAP password field — never let it be cached.
   res.set('Cache-Control', 'no-store');
@@ -209,7 +240,9 @@ async function handleAction(req, res) {
         message:
           process.status === PROCESS_STATUS.EXPIRED
             ? 'This approval link has expired.'
-            : 'This request has already been decided.',
+            : process.status === PROCESS_STATUS.SUPERSEDED
+              ? ALREADY_DECIDED_PAGE.message
+              : 'This request has already been decided.',
       })
     );
   }
@@ -218,6 +251,19 @@ async function handleAction(req, res) {
     return res.status(410).send(
       renderResultPage({ title: 'Link Expired', message: 'This approval link has expired.' })
     );
+  }
+
+  // Retire links whose stage was already decided in SAP (add-on), for both the
+  // page view and the decision submit.
+  const eligibility = await confirmStillActionableInSap(process);
+  if (eligibility && !eligibility.actionable) {
+    await markProcessSuperseded(processId, eligibility.reason);
+    logger.info('approval route: link retired; stage already decided in SAP', {
+      processId,
+      reason: eligibility.reason,
+      currentStage: eligibility.currentStage,
+    });
+    return res.status(410).send(renderResultPage(ALREADY_DECIDED_PAGE));
   }
 
   if (req.method === 'GET') {
@@ -329,6 +375,7 @@ async function handleDecisionPost(req, res, action, processId, process) {
       approverUserId: process.sap_user_id,
       approverUsername: process.user_code,
       approverPassword: sapPassword,
+      expectedStage: process.stage,
       remarks: req.body?.remarks || '',
     };
 
@@ -337,6 +384,19 @@ async function handleDecisionPost(req, res, action, processId, process) {
         ? await approvalService.approveRequest(params, undefined, params.remarks)
         : await approvalService.rejectRequest(params, undefined, params.remarks);
   } catch (error) {
+    // The stage was decided in SAP (add-on) between page load and submit —
+    // retire the link rather than releasing it for another attempt.
+    if (error instanceof ApprovalStageAdvancedError) {
+      await markProcessSuperseded(processId, error.meta?.reason || 'stage_advanced');
+      await markDecisionFailed(decisionLogId, `superseded:${error.meta?.reason || 'stage_advanced'}`);
+      logger.info('approval route: decision superseded by SAP add-on', {
+        processId,
+        reason: error.meta?.reason,
+        currentStage: error.meta?.currentStage,
+      });
+      return res.status(410).send(renderResultPage(ALREADY_DECIDED_PAGE));
+    }
+
     if (error instanceof ApprovalSapError) {
       logger.error('approval route: SAP decision failed', {
         approvalRequestId: error.meta?.approvalRequestId,

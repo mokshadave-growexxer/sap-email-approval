@@ -6,6 +6,29 @@ export const STATUS = Object.freeze({
   REJECT: 'ardNotApproved',
 });
 
+// SAP ApprovalRequest.Status (overall request) and ApprovalRequestLine.Status
+// (per-approver, per-stage line) domain values. SAP is the single source of
+// truth for whether a stage is still awaiting this approver's decision.
+export const REQUEST_STATUS = Object.freeze({
+  PENDING: 'arsPending',
+  APPROVED: 'arsApproved',
+  REJECTED: 'arsNotApproved',
+});
+
+export const LINE_STATUS = Object.freeze({
+  PENDING: 'ardPending',
+  APPROVED: 'ardApproved',
+  REJECTED: 'ardNotApproved',
+});
+
+export const DECISION_ELIGIBILITY = Object.freeze({
+  OK: 'ok',
+  REQUEST_NOT_PENDING: 'request_not_pending',
+  STAGE_ADVANCED: 'stage_advanced',
+  LINE_ALREADY_DECIDED: 'line_already_decided',
+  LINE_NOT_FOUND: 'line_not_found',
+});
+
 export class ApprovalError extends Error {
   constructor(message, code, meta = {}) {
     super(message);
@@ -33,6 +56,17 @@ export class ApprovalVerificationError extends ApprovalError {
       { approvalRequestId, approverUserId, expectedStatus }
     );
     this.name = 'ApprovalVerificationError';
+  }
+}
+
+export class ApprovalStageAdvancedError extends ApprovalError {
+  constructor(approvalRequestId, expectedStage, reason, meta = {}) {
+    super(
+      `ApprovalRequest ${approvalRequestId} is no longer awaiting a decision at stage ${expectedStage} (${reason}).`,
+      'STAGE_ADVANCED',
+      { approvalRequestId, expectedStage, reason, ...meta }
+    );
+    this.name = 'ApprovalStageAdvancedError';
   }
 }
 
@@ -209,6 +243,7 @@ export class ApprovalService {
       approverUserId: params.approverUserId,
       approverUsername: params.approverUsername,
       approverPassword: params.approverPassword,
+      expectedStage: params.expectedStage,
       remarks: params.remarks,
       decisionStatus: STATUS.APPROVE,
     });
@@ -221,12 +256,74 @@ export class ApprovalService {
       approverUserId: params.approverUserId,
       approverUsername: params.approverUsername,
       approverPassword: params.approverPassword,
+      expectedStage: params.expectedStage,
       remarks: params.remarks,
       decisionStatus: STATUS.REJECT,
     });
   }
 
-  async _decide({ approvalRequestId, decisionStatus, approverUserId, approverUsername, approverPassword, remarks }) {
+  /**
+   * Read-only check of whether a specific approver may still decide a specific
+   * stage of an approval request, according to SAP (the source of truth). Used
+   * to reject stale email links whose stage was already decided elsewhere (the
+   * SAP add-on), before any decision is attempted.
+   *
+   * @param {{ approvalRequestId: string|number, approverUserId: string|number, stage: string|number }} params
+   * @returns {Promise<Readonly<{ actionable: boolean, reason: string, overallStatus: string|null, currentStage: number|null, lineStatus: string|null }>>}
+   */
+  async getDecisionEligibility({ approvalRequestId, approverUserId, stage }) {
+    const requestId = this._normalizeApprovalRequestId(approvalRequestId);
+    const request = await this._executeWithSessionRecovery(
+      () => this._getApprovalRequest(requestId, '$select=Status,CurrentStage,ApprovalRequestLines'),
+      { approvalRequestId: requestId, action: 'GET_ELIGIBILITY' }
+    );
+    return this._evaluateDecisionEligibility(request, this._normalizeApproverUserId(approverUserId), stage);
+  }
+
+  /**
+   * Pure evaluation of decision eligibility against a fetched ApprovalRequest.
+   *
+   * @param {object} request - ApprovalRequest with Status, CurrentStage, ApprovalRequestLines.
+   * @param {string} approverUserId - Normalized approver UserID.
+   * @param {string|number|null} stage - StageCode the email link was issued for.
+   * @returns {Readonly<{ actionable: boolean, reason: string, overallStatus: string|null, currentStage: number|null, lineStatus: string|null }>}
+   */
+  _evaluateDecisionEligibility(request, approverUserId, stage) {
+    const overallStatus = request?.Status ?? null;
+    const currentStage = request?.CurrentStage != null ? Number(request.CurrentStage) : null;
+    const expectedStage = stage == null ? null : Number(stage);
+    const line = (request?.ApprovalRequestLines || []).find(
+      (candidate) =>
+        Number(candidate.UserID) === Number(approverUserId) &&
+        (expectedStage == null || Number(candidate.StageCode) === expectedStage)
+    );
+    const lineStatus = line?.Status ?? null;
+
+    const build = (reason) =>
+      Object.freeze({
+        actionable: reason === DECISION_ELIGIBILITY.OK,
+        reason,
+        overallStatus,
+        currentStage,
+        lineStatus,
+      });
+
+    if (overallStatus !== REQUEST_STATUS.PENDING) {
+      return build(DECISION_ELIGIBILITY.REQUEST_NOT_PENDING);
+    }
+    if (expectedStage != null && currentStage !== expectedStage) {
+      return build(DECISION_ELIGIBILITY.STAGE_ADVANCED);
+    }
+    if (!line) {
+      return build(DECISION_ELIGIBILITY.LINE_NOT_FOUND);
+    }
+    if (lineStatus !== LINE_STATUS.PENDING) {
+      return build(DECISION_ELIGIBILITY.LINE_ALREADY_DECIDED);
+    }
+    return build(DECISION_ELIGIBILITY.OK);
+  }
+
+  async _decide({ approvalRequestId, decisionStatus, approverUserId, approverUsername, approverPassword, expectedStage = null, remarks }) {
     const requestId = this._normalizeApprovalRequestId(approvalRequestId);
     const normalizedUserId = this._normalizeApproverUserId(approverUserId);
 
@@ -241,13 +338,26 @@ export class ApprovalService {
     logger.info('ApprovalService.decide: start', { approvalRequestId: requestId, decisionStatus, approverUserId: normalizedUserId });
 
     const before = await this._executeWithSessionRecovery(() => this._getApprovalRequest(requestId), { approvalRequestId: requestId, action: 'GET' });
-    if (before?.Status !== 'arsPending') {
+
+    // Authoritative freshness gate: SAP decides whether this approver may still
+    // act on this exact stage. A decision taken elsewhere (the SAP add-on)
+    // advances CurrentStage and/or flips the approver's line away from pending;
+    // in either case the decision must not proceed. Absent an explicit stage
+    // (legacy callers) the current stage is used, preserving prior behavior.
+    const effectiveStage =
+      expectedStage != null ? Number(expectedStage) : before?.CurrentStage != null ? Number(before.CurrentStage) : null;
+    const eligibility = this._evaluateDecisionEligibility(before, normalizedUserId, effectiveStage);
+    if (eligibility.reason === DECISION_ELIGIBILITY.REQUEST_NOT_PENDING) {
       throw new ApprovalNotPendingError(requestId, before?.Status ?? 'unknown');
     }
-
-    const approverLineBefore = this._findApproverLine(before, normalizedUserId);
-    if (!approverLineBefore) {
+    if (eligibility.reason === DECISION_ELIGIBILITY.LINE_NOT_FOUND) {
       throw new ApprovalUnauthorizedError(requestId, normalizedUserId);
+    }
+    if (!eligibility.actionable) {
+      throw new ApprovalStageAdvancedError(requestId, effectiveStage, eligibility.reason, {
+        currentStage: eligibility.currentStage,
+        lineStatus: eligibility.lineStatus,
+      });
     }
 
     const body = {
@@ -321,9 +431,13 @@ export class ApprovalService {
       approvalRequestLines: after?.ApprovalRequestLines ?? [],
     });
 
-    const approverLine = this._findApproverLine(after, normalizedUserId);
+    // Verify against the stage that was actually decided, not the request's
+    // current stage: approving a non-final stage advances CurrentStage, which
+    // would otherwise hide this approver's now-decided line and misreport a
+    // successful decision as unverified.
+    const approverLine = this._findApproverLineAtStage(after, normalizedUserId, effectiveStage);
     const lineConfirmed = Boolean(approverLine && approverLine.Status === decisionStatus);
-    const overallConfirmed = after?.Status !== 'arsPending';
+    const overallConfirmed = after?.Status !== REQUEST_STATUS.PENDING;
 
     if (!lineConfirmed) {
       throw new ApprovalVerificationError(requestId, normalizedUserId, decisionStatus);
@@ -482,12 +596,11 @@ export class ApprovalService {
     return this.sessionManager.client.patch(`/ApprovalRequests(${encodeURIComponent(approvalRequestId)})`, payload);
   }
 
-  _findApproverLine(approvalRequest, approverUserId) {
-    const lines = approvalRequest.ApprovalRequestLines || [];
+  _findApproverLineAtStage(approvalRequest, approverUserId, stage) {
+    const targetStage = stage != null ? Number(stage) : Number(approvalRequest?.CurrentStage);
+    const lines = approvalRequest?.ApprovalRequestLines || [];
     return lines.find(
-      (line) =>
-        Number(line.UserID) === Number(approverUserId) &&
-        Number(line.StageCode) === Number(approvalRequest.CurrentStage)
+      (line) => Number(line.UserID) === Number(approverUserId) && Number(line.StageCode) === targetStage
     );
   }
 
@@ -498,6 +611,7 @@ export class ApprovalService {
         approverUserId: input.approverUserId ?? input.userId ?? input.approver?.userId,
         approverUsername: input.approverUsername ?? input.approver?.username ?? input.approverCredentials?.username,
         approverPassword: input.approverPassword ?? input.approver?.password ?? input.approverCredentials?.password,
+        expectedStage: input.expectedStage ?? null,
         remarks: input.remarks ?? remarks,
       };
     }
@@ -507,6 +621,7 @@ export class ApprovalService {
       approverUserId: approver?.userId ?? approver?.id,
       approverUsername: approver?.username,
       approverPassword: approver?.password,
+      expectedStage: null,
       remarks,
     };
   }

@@ -236,6 +236,16 @@ export async function expireProcess(processId) {
   ]);
 }
 
+// Retire a link whose stage was already decided in SAP (the add-on). Only an
+// undecided local row is superseded, so a decision recorded through this
+// service is never overwritten.
+export async function markProcessSuperseded(processId, failureReason) {
+  await execute(
+    `UPDATE ${T()} SET "U_status" = ?, "U_failure_reason" = ? WHERE "Code" = ? AND "U_status" IN (?, ?)`,
+    [PROCESS_STATUS.SUPERSEDED, failureReason ?? null, processId, PROCESS_STATUS.PENDING, PROCESS_STATUS.PROCESSING]
+  );
+}
+
 // ---------- Decision-log interface (same row) ----------
 
 export async function logFailedDecision({ processId, failureReason }) {
