@@ -27,6 +27,10 @@ export const DECISION_ELIGIBILITY = Object.freeze({
   STAGE_ADVANCED: 'stage_advanced',
   LINE_ALREADY_DECIDED: 'line_already_decided',
   LINE_NOT_FOUND: 'line_not_found',
+  // The request itself is gone: editing a pending draft hard-deletes its
+  // approval request in SAP and creates a fresh one, so the old link's WddCode
+  // 404s. Any stale link to a deleted request must be retired.
+  REQUEST_NOT_FOUND: 'request_not_found',
 });
 
 export class ApprovalError extends Error {
@@ -56,6 +60,24 @@ export class ApprovalVerificationError extends ApprovalError {
       { approvalRequestId, approverUserId, expectedStatus }
     );
     this.name = 'ApprovalVerificationError';
+  }
+}
+
+export class ApprovalRequestNotFoundError extends ApprovalError {
+  constructor(approvalRequestId) {
+    super(`ApprovalRequest ${approvalRequestId} no longer exists.`, 'REQUEST_NOT_FOUND', { approvalRequestId });
+    this.name = 'ApprovalRequestNotFoundError';
+  }
+}
+
+export class ApprovalDocumentLockedError extends ApprovalError {
+  constructor(approvalRequestId, cause = null) {
+    super(
+      `The document for ApprovalRequest ${approvalRequestId} is being edited by another user.`,
+      'DOCUMENT_LOCKED',
+      { approvalRequestId, cause }
+    );
+    this.name = 'ApprovalDocumentLockedError';
   }
 }
 
@@ -126,6 +148,20 @@ export function redactApprovalDecisionBodyForLog(body) {
     ...body,
     ApprovalRequestDecisions: decisions,
   };
+}
+
+// SAP B1 signals a record held open by another user (edit lock) with specific
+// codes/messages. Detecting it lets the approver be told to retry, rather than
+// surfacing a raw error, when a decision collides with an in-progress edit.
+const SAP_LOCK_ERROR_CODES = new Set(['-1029', '-2028']);
+function isSapLockError(error) {
+  const data = error?.response?.data;
+  const code = String(data?.error?.code ?? data?.code ?? '');
+  const message = String(data?.error?.message?.value ?? data?.message?.value ?? error?.message ?? '').toLowerCase();
+  if (SAP_LOCK_ERROR_CODES.has(code) && /lock|another user|in use|being used|being modified/.test(message)) {
+    return true;
+  }
+  return /locked by another user|being used by another user|record is locked|currently being modified/.test(message);
 }
 
 function extractSapFailureMeta(error) {
@@ -273,10 +309,24 @@ export class ApprovalService {
    */
   async getDecisionEligibility({ approvalRequestId, approverUserId, stage }) {
     const requestId = this._normalizeApprovalRequestId(approvalRequestId);
-    const request = await this._executeWithSessionRecovery(
-      () => this._getApprovalRequest(requestId, '$select=Status,CurrentStage,ApprovalRequestLines'),
-      { approvalRequestId: requestId, action: 'GET_ELIGIBILITY' }
-    );
+    let request;
+    try {
+      request = await this._executeWithSessionRecovery(
+        () => this._getApprovalRequest(requestId, '$select=Status,CurrentStage,ApprovalRequestLines'),
+        { approvalRequestId: requestId, action: 'GET_ELIGIBILITY' }
+      );
+    } catch (error) {
+      if (error instanceof ApprovalRequestNotFoundError) {
+        return Object.freeze({
+          actionable: false,
+          reason: DECISION_ELIGIBILITY.REQUEST_NOT_FOUND,
+          overallStatus: null,
+          currentStage: null,
+          lineStatus: null,
+        });
+      }
+      throw error;
+    }
     return this._evaluateDecisionEligibility(request, this._normalizeApproverUserId(approverUserId), stage);
   }
 
@@ -337,7 +387,20 @@ export class ApprovalService {
 
     logger.info('ApprovalService.decide: start', { approvalRequestId: requestId, decisionStatus, approverUserId: normalizedUserId });
 
-    const before = await this._executeWithSessionRecovery(() => this._getApprovalRequest(requestId), { approvalRequestId: requestId, action: 'GET' });
+    let before;
+    try {
+      before = await this._executeWithSessionRecovery(() => this._getApprovalRequest(requestId), {
+        approvalRequestId: requestId,
+        action: 'GET',
+      });
+    } catch (error) {
+      // The request was hard-deleted — the originator edited the pending draft,
+      // which replaces the approval request with a new one. This link is stale.
+      if (error instanceof ApprovalRequestNotFoundError) {
+        throw new ApprovalStageAdvancedError(requestId, expectedStage, DECISION_ELIGIBILITY.REQUEST_NOT_FOUND);
+      }
+      throw error;
+    }
 
     // Authoritative freshness gate: SAP decides whether this approver may still
     // act on this exact stage. A decision taken elsewhere (the SAP add-on)
@@ -387,6 +450,12 @@ export class ApprovalService {
         decisionStatus,
       });
     } catch (err) {
+      // A live edit holds the document open: SAP refuses the write. Tell the
+      // approver to retry rather than surfacing a raw failure.
+      if (isSapLockError(err)) {
+        logger.warn('ApprovalService: decision blocked by document lock', { approvalRequestId: requestId });
+        throw new ApprovalDocumentLockedError(requestId, extractSapFailureMeta(err).sapErrorDetail);
+      }
       const { status, sapErrorDetail, friendlyMessage } = extractSapFailureMeta(err);
       logger.error('ApprovalService: PATCH failed', {
         approvalRequestId: requestId,
@@ -585,6 +654,9 @@ export class ApprovalService {
       const response = await this.sessionManager.client.get(url);
       return response?.data ?? response;
     } catch (error) {
+      if (error?.response?.status === 404) {
+        throw new ApprovalRequestNotFoundError(approvalRequestId);
+      }
       throw new ApprovalSapError(`Failed to GET ApprovalRequest ${approvalRequestId}`, {
         approvalRequestId,
         cause: this._getErrorMessage(error),

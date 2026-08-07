@@ -37,6 +37,20 @@ async function findActiveRow(approvalRequestId, sapUserId) {
 
 // ---------- Queue interface ----------
 
+// Locally-live links (awaiting a decision through this service). Used by the
+// poller to retire any whose SAP request has since vanished or been decided.
+export async function getActiveApprovalProcesses() {
+  const rows = await query(
+    `SELECT "Code","U_request_id","U_stage","U_sap_user_id" FROM ${T()} WHERE "U_status" IN ('pending','processing')`
+  );
+  return rows.map((r) => ({
+    id: r.Code,
+    approvalRequestId: r.U_request_id,
+    stage: r.U_stage,
+    sapUserId: r.U_sap_user_id,
+  }));
+}
+
 export async function getKnownApprovalStageKeys() {
   const rows = await query(
     `SELECT "U_request_id","U_stage","U_sap_user_id" FROM ${T()} WHERE "U_status" IN ('pending','processing')`

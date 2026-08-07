@@ -11,6 +11,8 @@ export const queueStore = {
   markFailed: (...a) => hana.markFailed(...a),
   attachProcess: (...a) => hana.attachProcess(...a),
   getRetryableFailedItems: (...a) => hana.getRetryableFailedItems(...a),
+  getActiveApprovalProcesses: (...a) => hana.getActiveApprovalProcesses(...a),
+  markSuperseded: (...a) => hana.markProcessSuperseded(...a),
 };
 
 export default queueStore;

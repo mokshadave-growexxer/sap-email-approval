@@ -2,6 +2,7 @@ import express from 'express';
 import logger from '../config/logger.js';
 import {
   ApprovalService,
+  ApprovalDocumentLockedError,
   ApprovalSapError,
   ApprovalStageAdvancedError,
   ApprovalUnauthorizedError,
@@ -196,8 +197,14 @@ function buildSapResponseForLog(error) {
 }
 
 const ALREADY_DECIDED_PAGE = Object.freeze({
-  title: 'Already Decided',
-  message: 'This request has already been decided in SAP. No further action is needed.',
+  title: 'Link No Longer Active',
+  message:
+    'This approval link is no longer active — the request was already decided, or the document was changed and a new approval was generated. Please use the most recent approval email.',
+});
+
+const DOCUMENT_LOCKED_PAGE = Object.freeze({
+  title: 'Document In Use',
+  message: 'This document is currently being edited by another user. Please try again in a little while.',
 });
 
 // Ask SAP (the source of truth) whether this approver may still act on the exact
@@ -384,6 +391,15 @@ async function handleDecisionPost(req, res, action, processId, process) {
         ? await approvalService.approveRequest(params, undefined, params.remarks)
         : await approvalService.rejectRequest(params, undefined, params.remarks);
   } catch (error) {
+    // A concurrent edit holds the document open in SAP. Keep the link usable and
+    // ask the approver to retry once the editor is done.
+    if (error instanceof ApprovalDocumentLockedError) {
+      await releaseProcess(processId);
+      await markDecisionFailed(decisionLogId, 'document_locked');
+      logger.info('approval route: decision blocked by document lock', { processId });
+      return res.status(409).send(renderResultPage(DOCUMENT_LOCKED_PAGE));
+    }
+
     // The stage was decided in SAP (add-on) between page load and submit —
     // retire the link rather than releasing it for another attempt.
     if (error instanceof ApprovalStageAdvancedError) {

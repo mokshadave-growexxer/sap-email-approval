@@ -10,8 +10,10 @@ const APPROVED_PATH =
 
 function createQueueStore() {
   const enqueued = [];
+  const superseded = [];
   const queueStore = {
     knownStageKeys: new Set(),
+    activeProcesses: [],
     async getKnownApprovalStageKeys() {
       return new Set(this.knownStageKeys);
     },
@@ -29,8 +31,14 @@ function createQueueStore() {
     async markProcessing() {},
     async markSent() {},
     async markFailed() {},
+    async getActiveApprovalProcesses() {
+      return this.activeProcesses;
+    },
+    async markSuperseded(processId, reason) {
+      superseded.push({ processId, reason });
+    },
   };
-  return { queueStore, enqueued };
+  return { queueStore, enqueued, superseded };
 }
 
 function createLogger() {
@@ -157,6 +165,59 @@ test('pollOnce enqueues only the first pending approver for a SAP stage', async 
     stageId: 61,
     draftEntry: undefined,
   });
+});
+
+test('pollOnce retires links whose SAP request has vanished, keeps still-pending ones', async () => {
+  const { queueStore, superseded } = createQueueStore();
+  // Two live local links: 101 is still pending in SAP; 999 was deleted by an edit.
+  queueStore.activeProcesses = [
+    { id: 'p-live', approvalRequestId: 101, stage: 61, sapUserId: 11 },
+    { id: 'p-stale', approvalRequestId: 999, stage: 61, sapUserId: 72 },
+  ];
+
+  const eligibilityCalls = [];
+  const sapSessionManager = {
+    async ensureLoggedIn() {
+      return { ok: true };
+    },
+    client: {
+      async get(path) {
+        if (path === APPROVED_PATH) return { data: [] };
+        assert.equal(path, PENDING_PATH);
+        return {
+          data: [
+            {
+              Code: 101,
+              Status: 'arsPending',
+              CurrentStage: 61,
+              ApprovalRequestLines: [{ UserID: 11, StageCode: 61, Status: 'ardPending' }],
+            },
+          ],
+        };
+      },
+    },
+  };
+
+  const worker = createQueueWorker({
+    queueStore,
+    sapSessionManager,
+    logger: createLogger(),
+    onNewApprovalQueued: () => {},
+    postApprovedDraftFn: async () => ({}),
+    confirmDecisionEligibility: async (params) => {
+      eligibilityCalls.push(params);
+      return { actionable: false, reason: 'request_not_found' };
+    },
+  });
+
+  await worker.pollOnce();
+
+  // Only the vanished request (999) is confirmed and retired; 101 is left live.
+  assert.deepEqual(
+    eligibilityCalls.map((c) => c.approvalRequestId),
+    [999]
+  );
+  assert.deepEqual(superseded, [{ processId: 'p-stale', reason: 'request_not_found' }]);
 });
 
 test('pollOnce posts approved draft sales orders via SaveDraftToDocument', async () => {

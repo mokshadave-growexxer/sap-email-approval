@@ -2,7 +2,7 @@ import logger from '../../config/logger.js';
 import { listCompanies, runInCompany, currentSL, currentCompany } from '../company/companyContext.js';
 import { queueStore as backendQueueStore } from './queueStore.js';
 import { sendApprovalEmail } from '../email/approvalEmailService.js';
-import { LINE_STATUS, postApprovedDraft } from '../sap/approvalService.js';
+import { ApprovalService, LINE_STATUS, postApprovedDraft } from '../sap/approvalService.js';
 
 const POLL_INTERVAL_MS = 30_000;
 const EMAIL_MAX_SEND_ATTEMPTS = 5;
@@ -34,6 +34,10 @@ const createDefaultQueueStore = () => ({
   async getRetryableFailedItems() {
     return [];
   },
+  async getActiveApprovalProcesses() {
+    return [];
+  },
+  async markSuperseded() {},
 });
 
 const createDefaultLogger = () => logger;
@@ -95,6 +99,7 @@ export function createQueueWorker({
   emailMaxSendAttempts = EMAIL_MAX_SEND_ATTEMPTS,
   emailRetryBackoffMinutes = EMAIL_RETRY_BACKOFF_MINUTES,
   resolveBaselineFn = null,
+  confirmDecisionEligibility = null,
 } = {}) {
   let pollTimer = null;
   /** @type {Set<string>} Drafts successfully posted in this process (avoid re-POSTing every poll). Keyed by company. */
@@ -113,6 +118,58 @@ export function createQueueWorker({
     return currentCompany().minRequestId ?? -Infinity;
   }
   const resolveBaseline = resolveBaselineFn ?? defaultResolveBaseline;
+
+  // Authoritative per-request eligibility check (SAP is the source of truth).
+  // Injected in tests; in production it reads the active company's session.
+  const confirmEligibility =
+    confirmDecisionEligibility ??
+    ((params) => new ApprovalService(injectedSessionManager).getDecisionEligibility(params));
+
+  // Retire links whose SAP request has vanished (the originator edited the
+  // pending draft, deleting its request) or was decided elsewhere (the add-on).
+  // Only a request absent from the current SAP pending set is a candidate, and
+  // each candidate is confirmed authoritatively before being superseded — a
+  // transient/partial poll can never wrongly retire a live link.
+  async function reconcileSupersededLinks(pendingSapRequests) {
+    let active;
+    try {
+      active = await queueStore.getActiveApprovalProcesses();
+    } catch (error) {
+      workerLogger.warn('queueWorker: could not load active links for reconciliation', {
+        error: error?.message || String(error),
+      });
+      return;
+    }
+    if (!Array.isArray(active) || active.length === 0) return;
+
+    const pendingIds = new Set(
+      (pendingSapRequests || []).map((r) => String(r.Code ?? r.Id ?? r.approvalRequestId))
+    );
+
+    for (const link of active) {
+      if (pendingIds.has(String(link.approvalRequestId))) continue;
+      try {
+        const eligibility = await confirmEligibility({
+          approvalRequestId: link.approvalRequestId,
+          approverUserId: link.sapUserId,
+          stage: link.stage,
+        });
+        if (eligibility && eligibility.actionable === false) {
+          await queueStore.markSuperseded(link.id, eligibility.reason);
+          workerLogger.info('queueWorker: retired superseded approval link', {
+            processId: link.id,
+            approvalRequestId: link.approvalRequestId,
+            reason: eligibility.reason,
+          });
+        }
+      } catch (error) {
+        workerLogger.warn('queueWorker: eligibility re-check failed; leaving link for next cycle', {
+          processId: link.id,
+          error: error?.message || String(error),
+        });
+      }
+    }
+  }
 
   // The SAP Service Layer paginates OData results (default 20 per page). Follow
   // @odata.nextLink so EVERY pending request is fetched, not just the first page
@@ -239,6 +296,10 @@ export function createQueueWorker({
       });
       return;
     }
+
+    // Retire any local links whose SAP request has vanished or been decided
+    // elsewhere, so an edited/superseded link stops being live within one cycle.
+    await reconcileSupersededLinks(pendingRequests);
 
     if (!Array.isArray(pendingRequests) || pendingRequests.length === 0) {
       workerLogger.info('queueWorker: no pending SAP approvals found');
