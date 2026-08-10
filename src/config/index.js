@@ -18,6 +18,24 @@ dotenv.config({ path: path.resolve(__dirname, '../../.env') });
  *
  * @returns {Array<{key: string, schema: string, companyDb: string}>}
  */
+/**
+ * Normalize a URL base path to either '' or '/segment[/segment...]' — a single
+ * leading slash, no trailing slash. The app is served under this prefix (e.g.
+ * '/salesorder') so it can share a host with other apps behind the reverse
+ * proxy; every generated link and the route mount derive from it.
+ *
+ * @param {string} raw
+ * @returns {string}
+ */
+export function normalizeBasePath(raw) {
+  const value = String(raw ?? '').trim();
+  if (!value || value === '/') {
+    return '';
+  }
+  const withLeadingSlash = value.startsWith('/') ? value : `/${value}`;
+  return withLeadingSlash.replace(/\/+$/, '');
+}
+
 export function parseCompanies(companiesCsv, { fallbackSchema, fallbackCompanyDb } = {}) {
   const companies = String(companiesCsv || '')
     .split(',')
@@ -103,6 +121,7 @@ const env = validateEnv([
   { key: 'SAP_SESSION_RENEW_BEFORE_MS', parse: 'int', default: 14 * 60 * 1000 },
   { key: 'SAP_REJECT_UNAUTHORIZED', default: 'true', allowed: ['true', 'false'] },
   { key: 'APP_BASE_URL' },
+  { key: 'BASE_PATH', default: '/salesorder' },
   { key: 'SMTP_HOST', default: '' },
   { key: 'SMTP_PORT', parse: 'int', default: 587 },
   { key: 'SMTP_USER', default: '' },
@@ -144,6 +163,7 @@ export const config = {
   host: env.HOST,
   appName: env.APP_NAME,
   appBaseUrl: env.APP_BASE_URL,
+  basePath: normalizeBasePath(env.BASE_PATH),
   jwtSecret: env.JWT_SECRET,
   jwtExpiresIn: env.JWT_EXPIRES_IN,
   approvalLinkTtlHours: env.APPROVAL_LINK_TTL_HOURS,

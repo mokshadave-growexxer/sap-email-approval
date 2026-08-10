@@ -33,6 +33,11 @@ import { writeDecisionRemark } from '../services/sap/decisionRemarkStore.js';
 import { linkApprovalFootprintsToDocument } from '../services/sap/footprintDocumentLinker.js';
 import { getSalesOrderChangeStatus } from '../services/sap/draftStatusService.js';
 import { currentCompany, currentCompanyHash } from '../services/company/companyContext.js';
+import {
+  companyActionPath,
+  companyFootprintClientPath,
+  companyFootprintRegisterPath,
+} from '../utils/appUrls.js';
 
 const router = express.Router();
 const approvalService = new ApprovalService();
@@ -98,7 +103,7 @@ function renderDecisionPage({ process, processId, companyHash, errorMessage = ''
 
         ${errorMessage ? `<div class="status err">${escapeHtml(errorMessage)}</div>` : ''}
 
-        <form method="post" action="/api/v1/c/${escapeHtml(companyHash)}/action/${escapeHtml(processId)}" data-process-id="${escapeHtml(processId)}" data-register-url="/api/v1/c/${escapeHtml(companyHash)}/footprint/register" autocomplete="off">
+        <form method="post" action="${escapeHtml(companyActionPath(companyHash, processId))}" data-process-id="${escapeHtml(processId)}" data-register-url="${escapeHtml(companyFootprintRegisterPath(companyHash))}" autocomplete="off">
           <input type="hidden" id="session_id" name="session_id" value="" />
 
           <label for="sap_user">SAP User ID</label>
@@ -125,7 +130,7 @@ function renderDecisionPage({ process, processId, companyHash, errorMessage = ''
       </div>
     </div>
   </div>
-  <script src="/api/v1/c/${escapeHtml(companyHash)}/footprint/client.js"></script>
+  <script src="${escapeHtml(companyFootprintClientPath(companyHash))}"></script>
 </body>
 </html>`;
 }

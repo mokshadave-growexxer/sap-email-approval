@@ -39,7 +39,9 @@ app.use(
   })
 );
 
-app.use('/api/v1', routes);
+// Served under the configured base path (e.g. /salesorder/api/v1) so the app can
+// share a host behind the reverse proxy. All emitted links use the same prefix.
+app.use(`${config.basePath}/api/v1`, routes);
 
 app.use(notFoundHandler);
 app.use(errorHandler);

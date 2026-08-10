@@ -4,6 +4,7 @@ import { createProcess, getProcess, PROCESS_STATUS } from '../approval/processSt
 import { getDraftAttachments } from '../sap/attachmentService.js';
 import { getSalesOrderChangeStatus } from '../sap/draftStatusService.js';
 import { currentSL, currentCompany, currentCompanyHash } from '../company/companyContext.js';
+import { absoluteActionUrl } from '../../utils/appUrls.js';
 import logger from '../../config/logger.js';
 
 // Development-only fallback so testing is not blocked if SAP /Users resolution
@@ -208,6 +209,43 @@ async function resolvePaymentTermName(code) {
   }
 }
 
+// Resolve an item master name (OITM.ItemName) for a code, memoized per email so
+// repeated codes across lines cost one Service Layer call. Not cached across
+// emails: item names are per-company and can be renamed, so each email reads
+// current data.
+async function resolveItemName(itemCode, memo) {
+  const key = String(itemCode ?? '').trim();
+  if (!key) {
+    return '';
+  }
+  if (memo.has(key)) {
+    return memo.get(key);
+  }
+  let name = '';
+  try {
+    const response = await currentSL().client.get(`/Items('${encodeURIComponent(key)}')?$select=ItemName`);
+    name = (response?.data ?? response)?.ItemName ?? '';
+  } catch (error) {
+    logger.warn('approvalEmailService: item name resolution failed', {
+      itemCode: key,
+      error: error?.message || String(error),
+    });
+  }
+  memo.set(key, name);
+  return name;
+}
+
+// Attach each line's packing item name: OITM.ItemName for the line's packing
+// code (RDR1/DRF1 U_Pcode).
+async function attachPackingItemNames(lines) {
+  const memo = new Map();
+  const enriched = [];
+  for (const line of lines) {
+    enriched.push({ ...line, PackingItemName: await resolveItemName(line?.U_Pcode, memo) });
+  }
+  return enriched;
+}
+
 async function resolveDraftEmailData({ approvalRequestId, draftEntry }) {
   await currentSL().ensureLoggedIn();
 
@@ -236,7 +274,7 @@ async function resolveDraftEmailData({ approvalRequestId, draftEntry }) {
     paymentTermName: await resolvePaymentTermName(draft?.PaymentGroupCode),
     incoterm: draft?.U_Incoterms ?? '',
     remark: draft?.Comments ?? '',
-    documentLines: normalizeArray(draft?.DocumentLines),
+    documentLines: await attachPackingItemNames(normalizeArray(draft?.DocumentLines)),
   };
 }
 
@@ -321,6 +359,8 @@ function buildApprovalEmailHtml({
               <td style="padding:10px 12px; border-top:1px solid #e5e7eb; color:#111827; font-size:13px;">${index + 1}</td>
               <td style="padding:10px 12px; border-top:1px solid #e5e7eb; color:#111827; font-size:13px;">${escapeHtml(line?.ItemDescription ?? '')}</td>
               <td style="padding:10px 12px; border-top:1px solid #e5e7eb; color:#111827; font-size:13px;">${escapeHtml(line?.FreeText ?? '')}</td>
+              <td style="padding:10px 12px; border-top:1px solid #e5e7eb; color:#111827; font-size:13px;">${escapeHtml(line?.U_Pcode ?? '')}</td>
+              <td style="padding:10px 12px; border-top:1px solid #e5e7eb; color:#111827; font-size:13px;">${escapeHtml(line?.PackingItemName ?? '')}</td>
               <td style="padding:10px 12px; border-top:1px solid #e5e7eb; color:#111827; font-size:13px; text-align:right;">${escapeHtml(formatQuantity(line?.Quantity))}</td>
               <td style="padding:10px 12px; border-top:1px solid #e5e7eb; color:#111827; font-size:13px; text-align:right;">${escapeHtml(formatMoney(line?.Price ?? line?.UnitPrice))}</td>
               <td style="padding:10px 12px; border-top:1px solid #e5e7eb; color:#111827; font-size:13px;">${escapeHtml(line?.Currency ?? '')}</td>
@@ -329,7 +369,7 @@ function buildApprovalEmailHtml({
         .join('')
     : `
             <tr>
-              <td colspan="6" style="padding:12px; border-top:1px solid #e5e7eb; color:#6b7280; font-size:13px;">No draft lines found.</td>
+              <td colspan="8" style="padding:12px; border-top:1px solid #e5e7eb; color:#6b7280; font-size:13px;">No draft lines found.</td>
             </tr>`;
 
   const metaRow = (label, value) =>
@@ -375,6 +415,8 @@ function buildApprovalEmailHtml({
                   <th style="text-align:left; padding:10px 12px; font-size:13px;">Sr.No.</th>
                   <th style="text-align:left; padding:10px 12px; font-size:13px;">Product Name</th>
                   <th style="text-align:left; padding:10px 12px; font-size:13px;">Brand Name</th>
+                  <th style="text-align:left; padding:10px 12px; font-size:13px;">Packing Code</th>
+                  <th style="text-align:left; padding:10px 12px; font-size:13px;">Packing Item Name</th>
                   <th style="text-align:right; padding:10px 12px; font-size:13px;">Quantity</th>
                   <th style="text-align:right; padding:10px 12px; font-size:13px;">Price</th>
                   <th style="text-align:left; padding:10px 12px; font-size:13px;">Currency</th>
@@ -480,9 +522,7 @@ export async function sendApprovalEmail({ approvalRequestId, approverUserId, app
     effectiveProcessId = processRow.id;
   }
 
-  const baseUrl = config.appBaseUrl.replace(/\/+$/, '');
-  const companyHash = currentCompanyHash();
-  const actionUrl = `${baseUrl}/api/v1/c/${companyHash}/action/${effectiveProcessId}`;
+  const actionUrl = absoluteActionUrl(currentCompanyHash(), effectiveProcessId);
 
   const html = buildApprovalEmailHtml({
     cardName: draftEmailData.cardName,
@@ -549,4 +589,10 @@ export async function sendApprovalEmail({ approvalRequestId, approverUserId, app
   return { processId: effectiveProcessId };
 }
 
-export { buildApprovalEmailHtml, buildApprovalHistory, buildApprovalHistoryHtml, resolveApproverContact };
+export {
+  buildApprovalEmailHtml,
+  buildApprovalHistory,
+  buildApprovalHistoryHtml,
+  resolveApproverContact,
+  resolveDraftEmailData,
+};
