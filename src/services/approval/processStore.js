@@ -6,7 +6,6 @@ export {
   claimProcess,
   markProcessDecided,
   releaseProcess,
-  expireProcess,
   markProcessSuperseded,
   getApprovedProcessesForRequest,
 } from './hanaApprovalStore.js';

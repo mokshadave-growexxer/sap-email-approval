@@ -504,8 +504,7 @@ export async function sendApprovalEmail({ approvalRequestId, approverUserId, app
   let effectiveProcessId = processId ?? null;
   if (effectiveProcessId) {
     const existing = await getProcess(effectiveProcessId);
-    const reusable =
-      existing && existing.status === PROCESS_STATUS.PENDING && new Date(existing.expires_at).getTime() > Date.now();
+    const reusable = existing && existing.status === PROCESS_STATUS.PENDING;
     if (!reusable) {
       effectiveProcessId = null;
     }

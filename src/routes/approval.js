@@ -16,7 +16,6 @@ import {
   PROCESS_FAILURE,
   PROCESS_STATUS,
   claimProcess,
-  expireProcess,
   getProcess,
   markProcessDecided,
   markProcessSuperseded,
@@ -244,24 +243,17 @@ async function handleAction(req, res) {
     );
   }
 
-  // Refuse an already-decided or expired link before any footprint work.
+  // Refuse an already-decided link before any footprint work. Links never expire
+  // by time; only a decision or a supersession retires them.
   if (process.status !== PROCESS_STATUS.PENDING) {
     return res.status(410).send(
       renderResultPage({
         title: 'Link No Longer Active',
         message:
-          process.status === PROCESS_STATUS.EXPIRED
-            ? 'This approval link has expired.'
-            : process.status === PROCESS_STATUS.SUPERSEDED
-              ? ALREADY_DECIDED_PAGE.message
-              : 'This request has already been decided.',
+          process.status === PROCESS_STATUS.SUPERSEDED
+            ? ALREADY_DECIDED_PAGE.message
+            : 'This request has already been decided.',
       })
-    );
-  }
-  if (new Date(process.expires_at).getTime() < Date.now()) {
-    await expireProcess(processId);
-    return res.status(410).send(
-      renderResultPage({ title: 'Link Expired', message: 'This approval link has expired.' })
     );
   }
 

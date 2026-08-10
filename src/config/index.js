@@ -102,7 +102,10 @@ const env = validateEnv([
   { key: 'APP_NAME', default: 'sap-email-approval' },
   { key: 'JWT_SECRET' },
   { key: 'JWT_EXPIRES_IN', default: '15m' },
-  { key: 'APPROVAL_LINK_TTL_HOURS', parse: 'int', default: 72 },
+  // 0 (default) means the approval link never expires by time — it stays valid
+  // until the request is decided (approved/rejected) or superseded. Set > 0 to
+  // impose a time-to-live in hours.
+  { key: 'APPROVAL_LINK_TTL_HOURS', parse: 'int', default: 0 },
   { key: 'FOOTPRINT_GEO_OPTIONAL', default: 'false', allowed: ['true', 'false'] },
   { key: 'HANA_HOST' },
   { key: 'HANA_PORT', parse: 'int', default: 30015 },

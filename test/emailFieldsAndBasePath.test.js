@@ -38,6 +38,10 @@ test('base path defaults to /salesorder', () => {
   assert.equal(config.basePath, '/salesorder');
 });
 
+test('approval links do not expire by time (default TTL is 0)', () => {
+  assert.equal(config.approvalLinkTtlHours, 0);
+});
+
 test('email line table shows Packing Code (U_Pcode) and its item name', () => {
   const html = buildApprovalEmailHtml({
     cardName: 'ACME Ltd',

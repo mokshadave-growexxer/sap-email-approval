@@ -140,7 +140,9 @@ export async function createProcess({
   level,
   ttlHours = config.approvalLinkTtlHours,
 }) {
-  const expiresAt = istIso(new Date(Date.now() + Number(ttlHours) * 3_600_000));
+  // No time-based expiry by default (ttlHours = 0): the link lives until the
+  // request is decided or superseded. A positive ttlHours re-enables a TTL.
+  const expiresAt = Number(ttlHours) > 0 ? istIso(new Date(Date.now() + Number(ttlHours) * 3_600_000)) : null;
   const existing = await findActiveRow(approvalRequestId, sapUserId);
 
   if (existing) {
@@ -211,18 +213,17 @@ export async function claimProcess(processId) {
   if (!processId) return { ok: false, reason: PROCESS_FAILURE.NOT_FOUND };
 
   const affected = await execute(
-    `UPDATE ${T()} SET "U_status" = ? WHERE "Code" = ? AND "U_status" = ? AND "U_expires_at" > ?`,
-    [PROCESS_STATUS.PROCESSING, processId, PROCESS_STATUS.PENDING, nowIso()]
+    `UPDATE ${T()} SET "U_status" = ? WHERE "Code" = ? AND "U_status" = ?`,
+    [PROCESS_STATUS.PROCESSING, processId, PROCESS_STATUS.PENDING]
   );
   if (affected === 1) {
     const rows = await query(`SELECT * FROM ${T()} WHERE "Code" = ?`, [processId]);
     return { ok: true, process: toProcess(rows[0]) };
   }
 
-  const rows = await query(`SELECT "U_status","U_expires_at" FROM ${T()} WHERE "Code" = ?`, [processId]);
+  const rows = await query(`SELECT "U_status" FROM ${T()} WHERE "Code" = ?`, [processId]);
   if (!rows.length) return { ok: false, reason: PROCESS_FAILURE.NOT_FOUND };
-  if (rows[0].U_status !== PROCESS_STATUS.PENDING) return { ok: false, reason: PROCESS_FAILURE.ALREADY_DECIDED };
-  return { ok: false, reason: PROCESS_FAILURE.EXPIRED };
+  return { ok: false, reason: PROCESS_FAILURE.ALREADY_DECIDED };
 }
 
 export async function markProcessDecided(processId, action) {
@@ -239,14 +240,6 @@ export async function releaseProcess(processId) {
     PROCESS_STATUS.PENDING,
     processId,
     PROCESS_STATUS.PROCESSING,
-  ]);
-}
-
-export async function expireProcess(processId) {
-  await execute(`UPDATE ${T()} SET "U_status" = ? WHERE "Code" = ? AND "U_status" = ?`, [
-    PROCESS_STATUS.EXPIRED,
-    processId,
-    PROCESS_STATUS.PENDING,
   ]);
 }
 
