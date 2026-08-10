@@ -416,7 +416,7 @@ function buildApprovalEmailHtml({
                   <th style="text-align:left; padding:10px 12px; font-size:13px;">Product Name</th>
                   <th style="text-align:left; padding:10px 12px; font-size:13px;">Brand Name</th>
                   <th style="text-align:left; padding:10px 12px; font-size:13px;">Packing Code</th>
-                  <th style="text-align:left; padding:10px 12px; font-size:13px;">Packing Item Name</th>
+                  <th style="text-align:left; padding:10px 12px; font-size:13px;">Packing Name</th>
                   <th style="text-align:right; padding:10px 12px; font-size:13px;">Quantity</th>
                   <th style="text-align:right; padding:10px 12px; font-size:13px;">Price</th>
                   <th style="text-align:left; padding:10px 12px; font-size:13px;">Currency</th>

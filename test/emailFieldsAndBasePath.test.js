@@ -56,7 +56,7 @@ test('email line table shows Packing Code (U_Pcode) and its item name', () => {
   });
 
   assert.match(html, /Packing Code/);
-  assert.match(html, /Packing Item Name/);
+  assert.match(html, /Packing Name/);
   assert.match(html, /PCPM0010/);
   assert.match(html, /Tank IBC \(white\) UN Certified-55-58kg/);
   // Product columns still present alongside the new ones.
