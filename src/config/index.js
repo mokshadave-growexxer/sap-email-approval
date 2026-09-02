@@ -102,6 +102,7 @@ const env = validateEnv([
   { key: 'APP_NAME', default: 'sap-email-approval' },
   { key: 'JWT_SECRET' },
   { key: 'JWT_EXPIRES_IN', default: '15m' },
+  { key: 'CREDENTIALS_ENC_KEY' },
   // 0 (default) means the approval link never expires by time — it stays valid
   // until the request is decided (approved/rejected) or superseded. Set > 0 to
   // impose a time-to-live in hours.
@@ -169,6 +170,7 @@ export const config = {
   basePath: normalizeBasePath(env.BASE_PATH),
   jwtSecret: env.JWT_SECRET,
   jwtExpiresIn: env.JWT_EXPIRES_IN,
+  credentialsEncKey: env.CREDENTIALS_ENC_KEY,
   approvalLinkTtlHours: env.APPROVAL_LINK_TTL_HOURS,
   footprintGeoOptional: env.FOOTPRINT_GEO_OPTIONAL === 'true',
   emailMode: env.EMAIL_MODE,

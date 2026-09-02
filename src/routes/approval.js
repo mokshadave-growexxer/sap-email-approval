@@ -3,6 +3,7 @@ import logger from '../config/logger.js';
 import {
   ApprovalService,
   ApprovalDocumentLockedError,
+  ApprovalInvalidCredentialsError,
   ApprovalSapError,
   ApprovalStageAdvancedError,
   ApprovalUnauthorizedError,
@@ -32,6 +33,7 @@ import { writeDecisionRemark } from '../services/sap/decisionRemarkStore.js';
 import { linkApprovalFootprintsToDocument } from '../services/sap/footprintDocumentLinker.js';
 import { getSalesOrderChangeStatus } from '../services/sap/draftStatusService.js';
 import { currentCompany, currentCompanyHash } from '../services/company/companyContext.js';
+import { getApproverCredential, upsertApproverCredential } from '../services/security/userCredentialStore.js';
 import {
   companyActionPath,
   companyFootprintClientPath,
@@ -51,7 +53,7 @@ function escapeHtml(value) {
     .replace(/"/g, '&quot;');
 }
 
-function renderDecisionPage({ process, processId, companyHash, errorMessage = '' }) {
+function renderDecisionPage({ process, processId, companyHash, needsPassword = false, message = '', messageKind = 'error' }) {
   const title = 'Approval Decision';
   const approvalRequestId = escapeHtml(process?.approval_request_id);
   const level = escapeHtml(process?.level);
@@ -100,17 +102,21 @@ function renderDecisionPage({ process, processId, companyHash, errorMessage = ''
           <div><span>Approval Level</span><strong>${level}</strong></div>
         </div>
 
-        ${errorMessage ? `<div class="status err">${escapeHtml(errorMessage)}</div>` : ''}
+        ${message ? `<div class="status ${messageKind === 'error' ? 'err' : ''}">${escapeHtml(message)}</div>` : ''}
 
         <form method="post" action="${escapeHtml(companyActionPath(companyHash, processId))}" data-process-id="${escapeHtml(processId)}" data-register-url="${escapeHtml(companyFootprintRegisterPath(companyHash))}" autocomplete="off">
           <input type="hidden" id="session_id" name="session_id" value="" />
 
           <label for="sap_user">SAP User ID</label>
           <input type="text" id="sap_user" value="${escapeHtml(process?.user_code)}" readonly tabindex="-1" aria-readonly="true" />
-
-          <label for="sap_password">Please enter your SAP password</label>
+${
+  needsPassword
+    ? `
+          <label for="sap_password">Enter your SAP password</label>
           <input type="password" id="sap_password" name="sap_password" autocomplete="off" autocapitalize="off" spellcheck="false" required placeholder="Your SAP password" />
-
+`
+    : ''
+}
           <label for="remarks">Remarks (optional)</label>
           <textarea id="remarks" name="remarks" placeholder="Add a note for the audit trail..."></textarea>
 
@@ -124,7 +130,11 @@ function renderDecisionPage({ process, processId, companyHash, errorMessage = ''
         </form>
 
         <div class="small">
-          Enter your SAP password, then choose Approve or Reject. The password is verified directly by SAP and is never stored. Your device fingerprint is recorded for the audit trail. This link works once and expires automatically.
+          ${
+            needsPassword
+              ? 'Enter your SAP password once to authorize this decision. It is stored securely (encrypted) and used only to submit your approvals to SAP — you won’t be asked again unless your SAP password changes. Your device and location are recorded for the audit trail.'
+              : 'Choose Approve or Reject. Your decision is submitted to SAP under your SAP user. Your device and location are recorded for the audit trail.'
+          }
         </div>
       </div>
     </div>
@@ -232,7 +242,7 @@ async function confirmStillActionableInSap(process) {
 }
 
 async function handleAction(req, res) {
-  // The decision page carries a SAP password field — never let it be cached.
+  // The decision page can carry a SAP password field — never let it be cached.
   res.set('Cache-Control', 'no-store');
   const { processId } = req.params;
   const process = await getProcess(processId);
@@ -283,7 +293,7 @@ async function handleAction(req, res) {
         process,
         processId,
         companyHash: currentCompanyHash(),
-        errorMessage: 'Please choose Approve or Reject.',
+        message: 'Please choose Approve or Reject.',
       })
     );
   }
@@ -354,22 +364,32 @@ async function handleDecisionPost(req, res, action, processId, process) {
     linkExpiry,
   });
 
-  // The approver's SAP password is typed on the decision page and used only to
-  // authenticate this one decision against SAP. It is never stored, never
-  // logged, and never echoed back. `sapPassword` is intentionally NOT spread
-  // into any log object below.
-  const sapPassword = req.body?.sap_password || '';
-  if (!sapPassword) {
-    await releaseProcess(processId);
-    await markDecisionFailed(decisionLogId, 'sap_password_missing');
-    return res.status(400).send(
-      renderDecisionPage({
-        process,
-        processId,
-        companyHash: currentCompanyHash(),
-        errorMessage: 'Please enter your SAP password.',
-      })
-    );
+  // The approver never types a password on the happy path: it is looked up from
+  // the encrypted credential store and injected into the SAP call. A password is
+  // only typed the first time (enrollment) or when SAP later rejects the stored
+  // one (they changed it). A typed password is enrolled on success. Passwords are
+  // never logged and never echoed back.
+  const typedPassword = req.body?.sap_password || '';
+  const enrollOnSuccess = Boolean(typedPassword);
+  let effectivePassword = typedPassword;
+
+  if (!typedPassword) {
+    const credential = await getApproverCredential(process.user_code);
+    if (!credential.found) {
+      await releaseProcess(processId);
+      return res.status(200).send(
+        renderDecisionPage({
+          process,
+          processId,
+          companyHash: currentCompanyHash(),
+          needsPassword: true,
+          messageKind: 'info',
+          message:
+            'First time here — please enter your SAP password once to authorize this decision. You won’t be asked again unless your SAP password changes.',
+        })
+      );
+    }
+    effectivePassword = credential.password;
   }
 
   let result;
@@ -378,7 +398,7 @@ async function handleDecisionPost(req, res, action, processId, process) {
       approvalRequestId: process.approval_request_id,
       approverUserId: process.sap_user_id,
       approverUsername: process.user_code,
-      approverPassword: sapPassword,
+      approverPassword: effectivePassword,
       expectedStage: process.stage,
       remarks: req.body?.remarks || '',
     };
@@ -410,6 +430,26 @@ async function handleDecisionPost(req, res, action, processId, process) {
       return res.status(410).send(renderResultPage(ALREADY_DECIDED_PAGE));
     }
 
+    // SAP rejected the password. Re-prompt for it: a wrong typed password just
+    // retries; a rejected stored password means it changed, so re-enroll.
+    if (error instanceof ApprovalInvalidCredentialsError) {
+      await releaseProcess(processId);
+      await markDecisionFailed(decisionLogId, enrollOnSuccess ? 'invalid_credentials_typed' : 'invalid_credentials_stored');
+      logger.info('approval route: SAP rejected approver credentials — re-prompting', { processId, wasStored: !enrollOnSuccess });
+      return res.status(200).send(
+        renderDecisionPage({
+          process,
+          processId,
+          companyHash: currentCompanyHash(),
+          needsPassword: true,
+          messageKind: enrollOnSuccess ? 'error' : 'info',
+          message: enrollOnSuccess
+            ? 'That SAP password was not accepted. Please check it and try again.'
+            : 'Your SAP password may have changed. Please enter your current SAP password once to continue.',
+        })
+      );
+    }
+
     if (error instanceof ApprovalSapError) {
       logger.error('approval route: SAP decision failed', {
         approvalRequestId: error.meta?.approvalRequestId,
@@ -424,8 +464,23 @@ async function handleDecisionPost(req, res, action, processId, process) {
 
     const status = error instanceof ApprovalUnauthorizedError ? 403 : 400;
     return res.status(status).send(
-      renderDecisionPage({ process, processId, companyHash: currentCompanyHash(), errorMessage: toHumanMessage(error) })
+      renderDecisionPage({ process, processId, companyHash: currentCompanyHash(), message: toHumanMessage(error) })
     );
+  }
+
+  // The decision went through with a freshly typed password — remember it
+  // (encrypted) so this approver won't be asked again. A storage failure must
+  // never undo the approval that already succeeded in SAP.
+  if (enrollOnSuccess) {
+    try {
+      await upsertApproverCredential(process.user_code, typedPassword);
+    } catch (storeError) {
+      logger.error('approval route: approval succeeded but storing the credential failed', {
+        processId,
+        userCode: process.user_code,
+        error: storeError?.message || String(storeError),
+      });
+    }
   }
 
   await markProcessDecided(processId, action);
@@ -514,4 +569,5 @@ async function handleDecisionPost(req, res, action, processId, process) {
 router.get('/action/:processId', (req, res) => handleAction(req, res));
 router.post('/action/:processId', (req, res) => handleAction(req, res));
 
+export { renderDecisionPage };
 export default router;

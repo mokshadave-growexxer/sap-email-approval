@@ -81,6 +81,17 @@ export class ApprovalDocumentLockedError extends ApprovalError {
   }
 }
 
+export class ApprovalInvalidCredentialsError extends ApprovalError {
+  constructor(approvalRequestId, approverUsername) {
+    super(
+      `SAP rejected the credentials for approver ${approverUsername} on ApprovalRequest ${approvalRequestId}.`,
+      'INVALID_CREDENTIALS',
+      { approvalRequestId, approverUsername }
+    );
+    this.name = 'ApprovalInvalidCredentialsError';
+  }
+}
+
 export class ApprovalStageAdvancedError extends ApprovalError {
   constructor(approvalRequestId, expectedStage, reason, meta = {}) {
     super(
@@ -162,6 +173,19 @@ function isSapLockError(error) {
     return true;
   }
   return /locked by another user|being used by another user|record is locked|currently being modified/.test(message);
+}
+
+// SAP rejects a decision whose ApproverPassword is wrong with code -8023 (or a
+// message to that effect). Distinguishing this lets the caller re-prompt the
+// approver for their current password rather than showing a generic failure.
+function isInvalidCredentialsFailure(error) {
+  const data = error?.response?.data;
+  const code = String(data?.error?.code ?? data?.code ?? '');
+  const message = String(data?.error?.message?.value ?? data?.message?.value ?? error?.message ?? '').toLowerCase();
+  if (code === '-8023') {
+    return true;
+  }
+  return /user code or password is incorrect|invalid credentials|password is incorrect|login failed/.test(message);
 }
 
 function extractSapFailureMeta(error) {
@@ -455,6 +479,11 @@ export class ApprovalService {
       if (isSapLockError(err)) {
         logger.warn('ApprovalService: decision blocked by document lock', { approvalRequestId: requestId });
         throw new ApprovalDocumentLockedError(requestId, extractSapFailureMeta(err).sapErrorDetail);
+      }
+      // The approver's password was wrong — let the caller re-prompt for it.
+      if (isInvalidCredentialsFailure(err)) {
+        logger.warn('ApprovalService: decision rejected — invalid approver credentials', { approvalRequestId: requestId });
+        throw new ApprovalInvalidCredentialsError(requestId, approverUsername);
       }
       const { status, sapErrorDetail, friendlyMessage } = extractSapFailureMeta(err);
       logger.error('ApprovalService: PATCH failed', {
