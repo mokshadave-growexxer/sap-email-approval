@@ -12,7 +12,8 @@ const tbl = (name) => table(name);
  * @returns {string}
  */
 export function buildAttachmentPath(srcPath, fileName, fileExt) {
-  const raw = String(srcPath || '');
+  const overridePath = process.env.ATTACHMENT_BASE_PATH;
+  const raw = String(overridePath || srcPath || '');
   const sep = raw.includes('/') && !raw.includes('\\') ? '/' : '\\';
   const base = raw.replace(/[\\/]+$/, '');
   const name = fileExt ? `${fileName}.${fileExt}` : String(fileName);
