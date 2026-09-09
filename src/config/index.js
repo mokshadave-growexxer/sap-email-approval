@@ -36,6 +36,22 @@ export function normalizeBasePath(raw) {
   return withLeadingSlash.replace(/\/+$/, '');
 }
 
+/**
+ * Parse a cutoff timestamp (ISO 8601, ideally with an explicit offset) into a
+ * Date, failing fast if it is unparseable so a misconfigured cutoff can never
+ * silently disable the delivery guard.
+ *
+ * @param {string} raw
+ * @returns {Date}
+ */
+export function parseCutoffDate(raw) {
+  const date = new Date(String(raw));
+  if (Number.isNaN(date.getTime())) {
+    throw new Error(`Invalid cutoff timestamp: "${raw}". Use an ISO 8601 value, e.g. 2026-09-09T23:00:00+05:30.`);
+  }
+  return date;
+}
+
 export function parseCompanies(companiesCsv, { fallbackSchema, fallbackCompanyDb } = {}) {
   const companies = String(companiesCsv || '')
     .split(',')
@@ -115,6 +131,14 @@ const env = validateEnv([
   { key: 'HANA_SCHEMA', default: '' },
   { key: 'SAP_COMPANIES', default: '' },
   { key: 'EMAIL_MODE', allowed: ['development', 'production'], default: 'development' },
+  // Until this instant, EMAIL_MODE=development delivers only to the test
+  // allowlist; at/after it, mail goes to the real approver. IST default.
+  { key: 'EMAIL_ALLOWLIST_UNTIL', default: '2026-09-09T23:00:00+05:30' },
+  // Only approval requests created on/after this date (the SO was punched or
+  // updated then) are emailed/processed. Skips the historical backlog. IST date.
+  { key: 'APPROVAL_MIN_CREATED_DATE', default: '2026-09-10' },
+  // Blind-copied on every approval email (monitoring). Empty = no BCC.
+  { key: 'EMAIL_BCC', default: 'sap1@matangiindustries.com' },
   { key: 'RATE_LIMIT_WINDOW_MS', parse: 'int', default: 15 * 60 * 1000 },
   { key: 'RATE_LIMIT_MAX', parse: 'int', default: 100 },
   { key: 'CORS_ORIGIN', default: '*' },
@@ -174,6 +198,9 @@ export const config = {
   approvalLinkTtlHours: env.APPROVAL_LINK_TTL_HOURS,
   footprintGeoOptional: env.FOOTPRINT_GEO_OPTIONAL === 'true',
   emailMode: env.EMAIL_MODE,
+  emailAllowlistUntil: parseCutoffDate(env.EMAIL_ALLOWLIST_UNTIL),
+  approvalMinCreatedDate: env.APPROVAL_MIN_CREATED_DATE,
+  emailBcc: env.EMAIL_BCC,
   companies,
   companyHashSecret: env.JWT_SECRET,
   hana: {

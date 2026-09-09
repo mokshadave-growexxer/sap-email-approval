@@ -14,18 +14,54 @@ const DEV_TEST_APPROVER_USERCODE_MAP = Object.freeze({
   2: 'manager',
 });
 
-// While EMAIL_MODE=development, approval emails are delivered only to these
-// addresses so testing never reaches real approvers. EMAIL_MODE=production
-// lifts the guard and mails the actual approver.
+// While EMAIL_MODE=development and the allowlist window is open, approval emails
+// are delivered only to these addresses so testing never reaches real approvers.
+// At/after EMAIL_ALLOWLIST_UNTIL (or in EMAIL_MODE=production) mail goes to the
+// actual approver (from OUSR).
 const TEST_EMAIL_ALLOWLIST = new Set(['sap1@matangiindustries.com', 'moksha.dave@growexx.com']);
 
 export function isTestAllowedRecipient(email) {
   return TEST_EMAIL_ALLOWLIST.has(String(email || '').trim().toLowerCase());
 }
 
-/** Whether the given recipient may actually be emailed under the current EMAIL_MODE. */
-export function canDeliverToRecipient(email) {
-  return config.emailMode === 'production' || isTestAllowedRecipient(email);
+/**
+ * Whether the given recipient may actually be emailed right now. Production
+ * always delivers; development delivers to anyone once the allowlist window has
+ * closed, and only to allowlisted addresses before that.
+ */
+export function canDeliverToRecipient(email, now = new Date()) {
+  if (config.emailMode === 'production') {
+    return true;
+  }
+  if (now.getTime() >= config.emailAllowlistUntil.getTime()) {
+    return true;
+  }
+  return isTestAllowedRecipient(email);
+}
+
+function formatDocDate(docDate) {
+  const iso = String(docDate ?? '').slice(0, 10);
+  const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(iso);
+  return match ? `${match[3]}/${match[2]}/${match[1]}` : '';
+}
+
+/** Email subject: "Approval Required: Sales Order {DocNum} / {dd/mm/yyyy}" (date omitted if absent). */
+export function buildApprovalSubject(docNum, docDate) {
+  const date = formatDocDate(docDate);
+  const base = `Approval Required: Sales Order ${docNum}`;
+  return date ? `${base} / ${date}` : base;
+}
+
+/** The monitoring BCC address for a send, or undefined when unset or equal to the recipient. */
+export function resolveBccRecipient(recipientEmail) {
+  const bcc = config.emailBcc;
+  if (!bcc) {
+    return undefined;
+  }
+  if (String(recipientEmail || '').trim().toLowerCase() === String(bcc).trim().toLowerCase()) {
+    return undefined;
+  }
+  return bcc;
 }
 
 /**
@@ -107,21 +143,15 @@ async function resolveApproverContact(approverInfo = {}) {
     source.stage;
   const userId = source.approverUserId ?? source.userId ?? source.userID ?? source.approver?.userId ?? null;
 
-  if (process.env.NODE_ENV !== 'development') {
-    throw new Error(
-      'resolveApproverContact: no production contact resolution implemented. Refusing to run outside development to prevent misdirected emails.'
-    );
-  }
-
-  const contact = DEV_TEST_APPROVER_MAP[String(stagePosition)];
-
-  if (!contact) {
-    throw new Error(`resolveApproverContact: no dev mapping for approver position ${stagePosition ?? 'unknown'} (UserID ${userId ?? 'unknown'}).`);
-  }
+  // The real recipient is the approver's OUSR email; this dev-only map is a
+  // convenience fallback so testing works when OUSR has no address. It is never
+  // consulted outside development, and never throws — missing recipients are
+  // handled by the caller.
+  const contact = process.env.NODE_ENV === 'development' ? DEV_TEST_APPROVER_MAP[String(stagePosition)] : null;
 
   return {
-    name: contact.name,
-    email: contact.email,
+    name: contact?.name ?? null,
+    email: contact?.email ?? null,
     approverUserId: userId,
     stageId: stagePosition,
   };
@@ -271,6 +301,7 @@ async function resolveDraftEmailData({ approvalRequestId, draftEntry }) {
     draftEntry: resolvedDraftEntry,
     cardName: draft?.CardName ?? '',
     docNum: draft?.DocNum ?? '',
+    docDate: draft?.DocDate ?? '',
     paymentTermName: await resolvePaymentTermName(draft?.PaymentGroupCode),
     incoterm: draft?.U_Incoterms ?? '',
     remark: draft?.Comments ?? '',
@@ -483,10 +514,18 @@ export async function sendApprovalEmail({ approvalRequestId, approverUserId, app
   });
   const recipientEmail = sapUser.email || contact.email;
 
-  // In development mode only allowlisted test recipients are emailed; production
-  // mails the real approver (EMAIL_MODE).
+  if (!recipientEmail) {
+    logger.warn('approvalEmailService: approver has no email address (OUSR eMail) — skipping send', {
+      approvalRequestId,
+      approverUserId,
+    });
+    return { skipped: true, reason: 'approver_email_missing', to: null };
+  }
+
+  // Before the allowlist window closes, development only mails the test
+  // allowlist; after it (or in production) the real approver is mailed.
   if (!canDeliverToRecipient(recipientEmail)) {
-    logger.warn('approvalEmailService: recipient not allowed in development EMAIL_MODE — skipping send', {
+    logger.warn('approvalEmailService: recipient not on the allowlist during the allowlist window — skipping send', {
       approvalRequestId,
       approverUserId,
       to: recipientEmail,
@@ -556,7 +595,8 @@ export async function sendApprovalEmail({ approvalRequestId, approverUserId, app
     const result = await getTransporter(company.key, smtp).sendMail({
       from: smtp.from,
       to: recipientEmail,
-      subject: `Approval Required: Sales Order ${draftEmailData.docNum}`,
+      bcc: resolveBccRecipient(recipientEmail),
+      subject: buildApprovalSubject(draftEmailData.docNum, draftEmailData.docDate),
       html,
       attachments,
     });

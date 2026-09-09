@@ -3,10 +3,10 @@ import assert from 'node:assert/strict';
 import { createQueueWorker } from '../src/services/queue/queueWorker.js';
 
 const PENDING_PATH =
-  "/ApprovalRequests?$filter=Status%20eq%20'arsPending'%20and%20ObjectType%20eq%20'17'%20and%20IsDraft%20eq%20'Y'&$select=Code,Status,CurrentStage,ObjectType,IsDraft,ObjectEntry,DraftEntry,ApprovalRequestLines";
+  "/ApprovalRequests?$filter=Status%20eq%20'arsPending'%20and%20ObjectType%20eq%20'17'%20and%20IsDraft%20eq%20'Y'&$select=Code,Status,CurrentStage,ObjectType,IsDraft,ObjectEntry,DraftEntry,CreationDate,ApprovalRequestLines";
 
 const APPROVED_PATH =
-  "/ApprovalRequests?$filter=Status%20eq%20'arsApproved'%20and%20ObjectType%20eq%20'17'%20and%20IsDraft%20eq%20'Y'&$select=Code,Status,CurrentStage,ObjectType,IsDraft,ObjectEntry,DraftEntry";
+  "/ApprovalRequests?$filter=Status%20eq%20'arsApproved'%20and%20ObjectType%20eq%20'17'%20and%20IsDraft%20eq%20'Y'&$select=Code,Status,CurrentStage,ObjectType,IsDraft,ObjectEntry,DraftEntry,CreationDate";
 
 function createQueueStore() {
   const enqueued = [];
@@ -327,4 +327,52 @@ test('pollOnce skips approved drafts without DraftEntry and retries failed posts
 
   await worker.pollOnce();
   assert.deepEqual(postedCalls, [9, 9]);
+});
+
+test('pollOnce enqueues only Sales Orders created on/after the date cutoff', async () => {
+  const { queueStore, enqueued } = createQueueStore();
+
+  const sapSessionManager = {
+    async ensureLoggedIn() {
+      return { ok: true };
+    },
+    client: {
+      async get(path) {
+        if (path === APPROVED_PATH) return { data: [] };
+        assert.equal(path, PENDING_PATH);
+        return {
+          data: [
+            {
+              Code: 700,
+              Status: 'arsPending',
+              CurrentStage: 1,
+              CreationDate: '2026-09-09',
+              ApprovalRequestLines: [{ UserID: 11, StageCode: 1, Status: 'ardPending' }],
+            },
+            {
+              Code: 701,
+              Status: 'arsPending',
+              CurrentStage: 1,
+              CreationDate: '2026-09-10',
+              ApprovalRequestLines: [{ UserID: 12, StageCode: 1, Status: 'ardPending' }],
+            },
+          ],
+        };
+      },
+    },
+  };
+
+  const worker = createQueueWorker({
+    queueStore,
+    sapSessionManager,
+    logger: createLogger(),
+    onNewApprovalQueued: () => {},
+    postApprovedDraftFn: async () => ({}),
+    resolveCreatedCutoffFn: () => '2026-09-10',
+  });
+
+  await worker.pollOnce();
+
+  assert.equal(enqueued.length, 1);
+  assert.equal(enqueued[0].approvalRequestId, 701);
 });

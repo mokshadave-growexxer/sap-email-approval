@@ -1,4 +1,5 @@
 import logger from '../../config/logger.js';
+import { config } from '../../config/index.js';
 import { listCompanies, runInCompany, currentSL, currentCompany } from '../company/companyContext.js';
 import { queueStore as backendQueueStore } from './queueStore.js';
 import { sendApprovalEmail } from '../email/approvalEmailService.js';
@@ -10,11 +11,23 @@ const EMAIL_RETRY_BACKOFF_MINUTES = 2;
 
 const PENDING_APPROVALS_PATH =
   "/ApprovalRequests?$filter=Status%20eq%20'arsPending'%20and%20ObjectType%20eq%20'17'%20and%20IsDraft%20eq%20'Y'" +
-  '&$select=Code,Status,CurrentStage,ObjectType,IsDraft,ObjectEntry,DraftEntry,ApprovalRequestLines';
+  '&$select=Code,Status,CurrentStage,ObjectType,IsDraft,ObjectEntry,DraftEntry,CreationDate,ApprovalRequestLines';
 
 const APPROVED_DRAFTS_PATH =
   "/ApprovalRequests?$filter=Status%20eq%20'arsApproved'%20and%20ObjectType%20eq%20'17'%20and%20IsDraft%20eq%20'Y'" +
-  '&$select=Code,Status,CurrentStage,ObjectType,IsDraft,ObjectEntry,DraftEntry';
+  '&$select=Code,Status,CurrentStage,ObjectType,IsDraft,ObjectEntry,DraftEntry,CreationDate';
+
+// An approval request is only handled when the SO was punched or updated on/after
+// this date (its ApprovalRequest.CreationDate). Editing a draft mints a new
+// request dated to the edit, so this catches both "punched" and "updated". A
+// null cutoff (injected tests) disables the filter.
+function isBeforeCreatedCutoff(creationDate, cutoffDate) {
+  if (!cutoffDate) {
+    return false;
+  }
+  const created = String(creationDate ?? '').slice(0, 10);
+  return created < cutoffDate;
+}
 
 const createDefaultQueueStore = () => ({
   async getKnownApprovalStageKeys() {
@@ -99,6 +112,7 @@ export function createQueueWorker({
   emailMaxSendAttempts = EMAIL_MAX_SEND_ATTEMPTS,
   emailRetryBackoffMinutes = EMAIL_RETRY_BACKOFF_MINUTES,
   resolveBaselineFn = null,
+  resolveCreatedCutoffFn = null,
   confirmDecisionEligibility = null,
 } = {}) {
   let pollTimer = null;
@@ -118,6 +132,14 @@ export function createQueueWorker({
     return currentCompany().minRequestId ?? -Infinity;
   }
   const resolveBaseline = resolveBaselineFn ?? defaultResolveBaseline;
+
+  // Date cutoff: only requests created on/after this date are handled. Disabled
+  // (null) under an injected session so unit tests are date-agnostic.
+  function defaultResolveCreatedCutoff() {
+    if (injectedSessionManager) return null;
+    return config.approvalMinCreatedDate ?? null;
+  }
+  const resolveCreatedCutoff = resolveCreatedCutoffFn ?? defaultResolveCreatedCutoff;
 
   // Authoritative per-request eligibility check (SAP is the source of truth).
   // Injected in tests; in production it reads the active company's session.
@@ -242,13 +264,18 @@ export function createQueueWorker({
       return;
     }
 
+    const createdCutoff = resolveCreatedCutoff();
     workerLogger.info('queueWorker: processing approved drafts', {
       approvedCount: approvedRequests.length,
+      createdCutoff,
     });
 
     for (const req of approvedRequests) {
       const approvalRequestId = req.Code ?? req.Id ?? req.approvalRequestId;
       const draftEntry = req.DraftEntry ?? req.draftEntry;
+
+      // Don't convert the historical backlog — only Sales Orders on/after cutoff.
+      if (isBeforeCreatedCutoff(req.CreationDate, createdCutoff)) continue;
 
       if (draftEntry === undefined || draftEntry === null || draftEntry === '') {
         workerLogger.warn('queueWorker: approved draft missing DraftEntry, skipping', {
@@ -307,11 +334,13 @@ export function createQueueWorker({
     }
 
     const baseline = resolveBaseline(pendingRequests);
+    const createdCutoff = resolveCreatedCutoff();
     const known = new Set([...(await queueStore.getKnownApprovalStageKeys())].map((value) => String(value)));
     workerLogger.info('queueWorker: processing pending approvals', {
       pendingCount: pendingRequests.length,
       knownCount: known.size,
       baseline,
+      createdCutoff,
     });
 
     for (const req of pendingRequests) {
@@ -320,6 +349,8 @@ export function createQueueWorker({
 
       // Skip the pre-existing backlog — only requests newer than the cutoff.
       if (Number(approvalRequestId) <= baseline) continue;
+      // Skip Sales Orders punched/updated before the go-live date cutoff.
+      if (isBeforeCreatedCutoff(req.CreationDate, createdCutoff)) continue;
 
       const actionable = getActionableApprovers(req);
       if (actionable.length === 0) continue;
