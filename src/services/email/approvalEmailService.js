@@ -393,6 +393,9 @@ function buildApprovalEmailHtml({
               <td style="padding:10px 12px; border-top:1px solid #e5e7eb; color:#111827; font-size:13px;">${escapeHtml(line?.U_Pcode ?? '')}</td>
               <td style="padding:10px 12px; border-top:1px solid #e5e7eb; color:#111827; font-size:13px;">${escapeHtml(line?.PackingItemName ?? '')}</td>
               <td style="padding:10px 12px; border-top:1px solid #e5e7eb; color:#111827; font-size:13px; text-align:right;">${escapeHtml(formatQuantity(line?.Quantity))}</td>
+              <td style="padding:10px 12px; border-top:1px solid #e5e7eb; color:#111827; font-size:13px; text-align:right;">${escapeHtml(formatMoney(line?.U_Ex_work_pkg))}</td>
+              <td style="padding:10px 12px; border-top:1px solid #e5e7eb; color:#111827; font-size:13px; text-align:right;">${escapeHtml(formatMoney(line?.U_FOB_pkg))}</td>
+              <td style="padding:10px 12px; border-top:1px solid #e5e7eb; color:#111827; font-size:13px; text-align:right;">${escapeHtml(formatMoney(line?.U_Freight_pkg))}</td>
               <td style="padding:10px 12px; border-top:1px solid #e5e7eb; color:#111827; font-size:13px; text-align:right;">${escapeHtml(formatMoney(line?.Price ?? line?.UnitPrice))}</td>
               <td style="padding:10px 12px; border-top:1px solid #e5e7eb; color:#111827; font-size:13px;">${escapeHtml(line?.Currency ?? '')}</td>
             </tr>`
@@ -400,7 +403,7 @@ function buildApprovalEmailHtml({
         .join('')
     : `
             <tr>
-              <td colspan="8" style="padding:12px; border-top:1px solid #e5e7eb; color:#6b7280; font-size:13px;">No draft lines found.</td>
+              <td colspan="11" style="padding:12px; border-top:1px solid #e5e7eb; color:#6b7280; font-size:13px;">No draft lines found.</td>
             </tr>`;
 
   const metaRow = (label, value) =>
@@ -449,6 +452,9 @@ function buildApprovalEmailHtml({
                   <th style="text-align:left; padding:10px 12px; font-size:13px;">Packing Code</th>
                   <th style="text-align:left; padding:10px 12px; font-size:13px;">Packing Name</th>
                   <th style="text-align:right; padding:10px 12px; font-size:13px;">Quantity</th>
+                  <th style="text-align:right; padding:10px 12px; font-size:13px;">Ex-Work Price (per kg)</th>
+                  <th style="text-align:right; padding:10px 12px; font-size:13px;">FOB Price (per kg)</th>
+                  <th style="text-align:right; padding:10px 12px; font-size:13px;">Freight Price (per kg)</th>
                   <th style="text-align:right; padding:10px 12px; font-size:13px;">Price</th>
                   <th style="text-align:left; padding:10px 12px; font-size:13px;">Currency</th>
                 </tr>
