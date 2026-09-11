@@ -187,6 +187,17 @@ function formatQuantity(value) {
   return Number.isFinite(num) ? String(num) : String(value);
 }
 
+// Total freight for a line = quantity x freight-per-kg (RDR1/DRF1 U_Freight_pkg).
+// Empty when either value is missing, so no total is shown for such lines.
+function lineFreightTotal(line) {
+  const quantity = Number(line?.Quantity);
+  const perKg = Number(line?.U_Freight_pkg);
+  if (!Number.isFinite(quantity) || !Number.isFinite(perKg)) {
+    return '';
+  }
+  return formatMoney(quantity * perKg);
+}
+
 function getSapDateTimeSortValue(updateDate, updateTime) {
   const date = String(updateDate ?? '').trim();
   const time = String(updateTime ?? '').trim();
@@ -235,6 +246,27 @@ async function resolvePaymentTermName(code) {
     paymentTermNameCache.set(key, name);
     return name;
   } catch {
+    return '';
+  }
+}
+
+// The customer's label type (OCRD U_LabelType), looked up by the draft's
+// CardCode. Read per email so a change on the business partner is reflected.
+async function resolveLabelType(cardCode) {
+  const code = String(cardCode ?? '').trim();
+  if (!code) {
+    return '';
+  }
+  try {
+    const response = await currentSL().client.get(
+      `/BusinessPartners('${encodeURIComponent(code)}')?$select=U_LabelType`
+    );
+    return (response?.data ?? response)?.U_LabelType ?? '';
+  } catch (error) {
+    logger.warn('approvalEmailService: label type resolution failed', {
+      cardCode: code,
+      error: error?.message || String(error),
+    });
     return '';
   }
 }
@@ -304,6 +336,10 @@ async function resolveDraftEmailData({ approvalRequestId, draftEntry }) {
     docDate: draft?.DocDate ?? '',
     paymentTermName: await resolvePaymentTermName(draft?.PaymentGroupCode),
     incoterm: draft?.U_Incoterms ?? '',
+    portOfLoading: draft?.U_PLoad ?? '',
+    portOfDischarge: draft?.U_PDischrg ?? '',
+    destinationCountry: draft?.U_DConName ?? '',
+    labelType: await resolveLabelType(draft?.CardCode),
     remark: draft?.Comments ?? '',
     documentLines: await attachPackingItemNames(normalizeArray(draft?.DocumentLines)),
   };
@@ -376,6 +412,10 @@ function buildApprovalEmailHtml({
   cardName,
   paymentTermName = '',
   incoterm = '',
+  portOfLoading = '',
+  portOfDischarge = '',
+  destinationCountry = '',
+  labelType = '',
   remark = '',
   documentLines,
   actionUrl,
@@ -384,8 +424,9 @@ function buildApprovalEmailHtml({
 }) {
   const lineRows = documentLines.length
     ? documentLines
-        .map(
-          (line, index) => `
+        .map((line, index) => {
+          const freightTotal = lineFreightTotal(line);
+          return `
             <tr>
               <td style="padding:10px 12px; border-top:1px solid #e5e7eb; color:#111827; font-size:13px;">${index + 1}</td>
               <td style="padding:10px 12px; border-top:1px solid #e5e7eb; color:#111827; font-size:13px;">${escapeHtml(line?.ItemDescription ?? '')}</td>
@@ -395,11 +436,15 @@ function buildApprovalEmailHtml({
               <td style="padding:10px 12px; border-top:1px solid #e5e7eb; color:#111827; font-size:13px; text-align:right;">${escapeHtml(formatQuantity(line?.Quantity))}</td>
               <td style="padding:10px 12px; border-top:1px solid #e5e7eb; color:#111827; font-size:13px; text-align:right;">${escapeHtml(formatMoney(line?.U_Ex_work_pkg))}</td>
               <td style="padding:10px 12px; border-top:1px solid #e5e7eb; color:#111827; font-size:13px; text-align:right;">${escapeHtml(formatMoney(line?.U_FOB_pkg))}</td>
-              <td style="padding:10px 12px; border-top:1px solid #e5e7eb; color:#111827; font-size:13px; text-align:right;">${escapeHtml(formatMoney(line?.U_Freight_pkg))}</td>
+              <td style="padding:10px 12px; border-top:1px solid #e5e7eb; color:#111827; font-size:13px; text-align:right;">${escapeHtml(formatMoney(line?.U_Freight_pkg))}${
+                freightTotal
+                  ? `<div style="margin-top:4px; font-size:11px; color:#6b7280;">Total: ${escapeHtml(freightTotal)}</div>`
+                  : ''
+              }</td>
               <td style="padding:10px 12px; border-top:1px solid #e5e7eb; color:#111827; font-size:13px; text-align:right;">${escapeHtml(formatMoney(line?.Price ?? line?.UnitPrice))}</td>
               <td style="padding:10px 12px; border-top:1px solid #e5e7eb; color:#111827; font-size:13px;">${escapeHtml(line?.Currency ?? '')}</td>
-            </tr>`
-        )
+            </tr>`;
+        })
         .join('')
     : `
             <tr>
@@ -422,7 +467,7 @@ function buildApprovalEmailHtml({
   <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background-color:#f4f5f7; padding:24px 0;">
     <tr>
       <td align="center">
-        <table role="presentation" width="480" cellpadding="0" cellspacing="0" style="background-color:#ffffff; border-radius:8px; overflow:hidden; box-shadow:0 1px 3px rgba(0,0,0,0.1);">
+        <table role="presentation" width="760" cellpadding="0" cellspacing="0" style="background-color:#ffffff; border-radius:8px; overflow:hidden; box-shadow:0 1px 3px rgba(0,0,0,0.1);">
           <tr>
             <td style="background-color:#1a2b4c; padding:20px 32px;">
               <span style="color:#ffffff; font-size:18px; font-weight:bold;">Approval Required</span>${buildChangeStatusBadgeHtml(changeStatus)}
@@ -441,6 +486,10 @@ function buildApprovalEmailHtml({
                 ${metaRow('Customer', cardName)}
                 ${metaRow('Payment Term', paymentTermName)}
                 ${metaRow('Incoterms', incoterm)}
+                ${metaRow('Port of Loading', portOfLoading)}
+                ${metaRow('Port of Discharge', portOfDischarge)}
+                ${metaRow('Destination Country Name', destinationCountry)}
+                ${metaRow('Label Type', labelType)}
                 ${metaRow('Remark', remark)}
               </table>
 
@@ -572,6 +621,10 @@ export async function sendApprovalEmail({ approvalRequestId, approverUserId, app
     cardName: draftEmailData.cardName,
     paymentTermName: draftEmailData.paymentTermName,
     incoterm: draftEmailData.incoterm,
+    portOfLoading: draftEmailData.portOfLoading,
+    portOfDischarge: draftEmailData.portOfDischarge,
+    destinationCountry: draftEmailData.destinationCountry,
+    labelType: draftEmailData.labelType,
     remark: draftEmailData.remark,
     documentLines: draftEmailData.documentLines,
     actionUrl,

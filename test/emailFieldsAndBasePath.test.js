@@ -85,3 +85,44 @@ test('empty line table spans all columns', () => {
   assert.match(html, /colspan="11"/);
   assert.match(html, /No draft lines found/);
 });
+
+test('email header shows the shipping fields and label type, between Incoterms and Remark', () => {
+  const html = buildApprovalEmailHtml({
+    cardName: 'ACME',
+    portOfLoading: 'Nhava Sheva (INNSA)',
+    portOfDischarge: 'Jebel Ali (AEJEA)',
+    destinationCountry: 'United Arab Emirates',
+    labelType: 'Private Label',
+    documentLines: [],
+    actionUrl: 'https://x/a',
+  });
+  assert.match(html, /Port of Loading/);
+  assert.match(html, /Nhava Sheva \(INNSA\)/);
+  assert.match(html, /Port of Discharge/);
+  assert.match(html, /Jebel Ali \(AEJEA\)/);
+  assert.match(html, /Destination Country Name/);
+  assert.match(html, /United Arab Emirates/);
+  assert.match(html, /Label Type/);
+  assert.match(html, /Private Label/);
+  assert.ok(html.indexOf('Incoterms') < html.indexOf('Port of Loading'), 'shipping fields after Incoterms');
+  assert.ok(html.indexOf('Label Type') < html.indexOf('Remark'), 'shipping fields before Remark');
+});
+
+test('freight column shows the per-kg value and the line total (qty x per-kg)', () => {
+  const html = buildApprovalEmailHtml({
+    cardName: 'ACME',
+    documentLines: [{ Quantity: 10000, U_Freight_pkg: 2.5 }],
+    actionUrl: 'https://x/a',
+  });
+  assert.match(html, /2\.50/); // per-kg freight
+  assert.match(html, /Total:\s*25000\.00/); // quantity x per-kg
+});
+
+test('freight total is omitted when quantity or per-kg freight is absent', () => {
+  const html = buildApprovalEmailHtml({
+    cardName: 'ACME',
+    documentLines: [{ Quantity: 10000 }], // no U_Freight_pkg
+    actionUrl: 'https://x/a',
+  });
+  assert.doesNotMatch(html, /Total:/);
+});
