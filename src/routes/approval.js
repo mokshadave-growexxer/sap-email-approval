@@ -1,13 +1,6 @@
 import express from 'express';
 import logger from '../config/logger.js';
-import {
-  ApprovalService,
-  ApprovalDocumentLockedError,
-  ApprovalInvalidCredentialsError,
-  ApprovalSapError,
-  ApprovalStageAdvancedError,
-  ApprovalUnauthorizedError,
-} from '../services/sap/approvalService.js';
+import { ApprovalService, ApprovalInvalidCredentialsError } from '../services/sap/approvalService.js';
 import {
   GATE_FAILURE,
   consumeFootprintSession,
@@ -16,23 +9,12 @@ import {
 import {
   PROCESS_FAILURE,
   PROCESS_STATUS,
-  claimProcess,
   getProcess,
-  markProcessDecided,
   markProcessSuperseded,
-  releaseProcess,
 } from '../services/approval/processStore.js';
-import {
-  createPendingDecision,
-  logFailedDecision,
-  markDecisionFailed,
-  markDecisionSuccess,
-} from '../services/audit/decisionLogService.js';
-import { scheduleFinalDocReconciliation } from '../services/audit/finalDocReconciler.js';
-import { writeDecisionRemark } from '../services/sap/decisionRemarkStore.js';
-import { linkApprovalFootprintsToDocument } from '../services/sap/footprintDocumentLinker.js';
-import { getSalesOrderChangeStatus } from '../services/sap/draftStatusService.js';
-import { currentCompany, currentCompanyHash } from '../services/company/companyContext.js';
+import { logFailedDecision } from '../services/audit/decisionLogService.js';
+import { executeDecision, DECISION_OUTCOME } from '../services/approval/decisionExecutor.js';
+import { currentCompanyHash } from '../services/company/companyContext.js';
 import { getApproverCredential, upsertApproverCredential } from '../services/security/userCredentialStore.js';
 import {
   companyActionPath,
@@ -174,13 +156,6 @@ function renderResultPage({ title, message, details = '' }) {
 </html>`;
 }
 
-function toHumanMessage(error) {
-  if (error instanceof ApprovalUnauthorizedError) return 'You are not authorized to approve or reject this request.';
-  if (error instanceof ApprovalSapError && error.meta?.friendlyMessage) return error.meta.friendlyMessage;
-  // Never surface raw SAP/internal error detail to the browser.
-  return 'Your SAP password could not be verified, or the decision could not be completed. Please check your password and try again.';
-}
-
 const FAILURE_MESSAGES = Object.freeze({
   [GATE_FAILURE.NO_SESSION]:
     'Location verification is required before you can decide. Please reopen the link and allow location access.',
@@ -197,17 +172,6 @@ const FAILURE_MESSAGES = Object.freeze({
 
 function failureMessage(reason) {
   return FAILURE_MESSAGES[reason] || 'This decision could not be verified. Please reopen the link and try again.';
-}
-
-function linkTimestamps(process) {
-  return { linkSentAt: process?.sent_at ?? null, linkExpiry: process?.expires_at ?? null };
-}
-
-function buildSapResponseForLog(error) {
-  if (error instanceof ApprovalSapError) {
-    return { message: error.message, code: error.code ?? null, meta: error.meta ?? null };
-  }
-  return { message: error?.message || String(error) };
 }
 
 const ALREADY_DECIDED_PAGE = Object.freeze({
@@ -302,73 +266,18 @@ async function handleAction(req, res) {
 }
 
 async function handleDecisionPost(req, res, action, processId, process) {
-  const sessionId = req.body?.session_id;
   const postIp = getClientIp(req);
-  const userAgent = req.headers['user-agent'] || null;
-  const { linkSentAt, linkExpiry } = linkTimestamps(process);
+  const sessionId = req.body?.session_id;
+  const remarks = req.body?.remarks || '';
+  const companyHash = currentCompanyHash();
 
-  const auditFailure = (failureReason, footprintSessionId = null) =>
-    logFailedDecision({
-      processId,
-      approvalRequestId: process.approval_request_id,
-      action,
-      approverUserId: process.sap_user_id,
-      userCode: process.user_code,
-      postIpAddress: postIp,
-      userAgent,
-      linkSentAt,
-      linkExpiry,
-      footprintSessionId,
-      failureReason,
-    });
+  const auditFailure = (failureReason) => logFailedDecision({ processId, failureReason });
 
-  // Footprint gate (the location/device boundary) — verified in the DB, not the button.
-  const gate = await consumeFootprintSession({ sessionId, processId });
-  if (!gate.ok) {
-    await auditFailure(gate.reason, sessionId || null);
-    logger.warn('approval route: footprint gate rejected decision', { processId, reason: gate.reason });
-    return res.status(403).send(
-      renderResultPage({ title: 'Verification Required', message: failureMessage(gate.reason) })
-    );
-  }
-  const session = gate.session;
-
-  // Claim the process (one-time + expiry), race-safe.
-  const claim = await claimProcess(processId);
-  if (!claim.ok) {
-    await auditFailure(claim.reason, session.session_id);
-    logger.warn('approval route: process claim rejected decision', { processId, reason: claim.reason });
-    return res.status(410).send(
-      renderResultPage({ title: 'Link No Longer Active', message: failureMessage(claim.reason) })
-    );
-  }
-
-  if (session.ip_address && postIp && session.ip_address !== postIp) {
-    logger.info('approval route: IP differs between footprint capture and decision', {
-      processId,
-      footprintIp: session.ip_address,
-      postIp,
-    });
-  }
-
-  const { id: decisionLogId } = await createPendingDecision({
-    processId,
-    approvalRequestId: process.approval_request_id,
-    action,
-    approverUserId: process.sap_user_id,
-    userCode: process.user_code,
-    approverEmail: process.approver_email,
-    session,
-    postIpAddress: postIp,
-    linkSentAt,
-    linkExpiry,
-  });
-
-  // The approver never types a password on the happy path: it is looked up from
-  // the encrypted credential store and injected into the SAP call. A password is
-  // only typed the first time (enrollment) or when SAP later rejects the stored
-  // one (they changed it). A typed password is enrolled on success. Passwords are
-  // never logged and never echoed back.
+  // Resolve the approver's SAP password before touching the process. On the happy
+  // path it comes from the encrypted store; only first-time enrollment or a
+  // changed password requires typing it. Resolving first means a not-yet-enrolled
+  // approver is prompted without consuming their location capture or claiming the
+  // process. Passwords are never logged and never echoed back.
   const typedPassword = req.body?.sap_password || '';
   const enrollOnSuccess = Boolean(typedPassword);
   let effectivePassword = typedPassword;
@@ -376,12 +285,11 @@ async function handleDecisionPost(req, res, action, processId, process) {
   if (!typedPassword) {
     const credential = await getApproverCredential(process.user_code);
     if (!credential.found) {
-      await releaseProcess(processId);
       return res.status(200).send(
         renderDecisionPage({
           process,
           processId,
-          companyHash: currentCompanyHash(),
+          companyHash,
           needsPassword: true,
           messageKind: 'info',
           message:
@@ -392,55 +300,41 @@ async function handleDecisionPost(req, res, action, processId, process) {
     effectivePassword = credential.password;
   }
 
-  let result;
+  // Footprint gate (the location/device boundary) — verified in the DB, not the button.
+  const gate = await consumeFootprintSession({ sessionId, processId });
+  if (!gate.ok) {
+    await auditFailure(gate.reason);
+    logger.warn('approval route: footprint gate rejected decision', { processId, reason: gate.reason });
+    return res.status(403).send(
+      renderResultPage({ title: 'Verification Required', message: failureMessage(gate.reason) })
+    );
+  }
+  const session = gate.session;
+
+  if (session.ip_address && postIp && session.ip_address !== postIp) {
+    logger.info('approval route: IP differs between footprint capture and decision', {
+      processId,
+      footprintIp: session.ip_address,
+      postIp,
+    });
+  }
+
+  // The single decision goes through the same executor the bulk digest uses, so
+  // both paths share identical SAP claim/decide/verify/post-draft semantics.
+  let outcome;
   try {
-    const params = {
-      approvalRequestId: process.approval_request_id,
-      approverUserId: process.sap_user_id,
-      approverUsername: process.user_code,
-      approverPassword: effectivePassword,
-      expectedStage: process.stage,
-      remarks: req.body?.remarks || '',
-    };
-
-    result =
-      action === ACTIONS.APPROVE
-        ? await approvalService.approveRequest(params, undefined, params.remarks)
-        : await approvalService.rejectRequest(params, undefined, params.remarks);
+    outcome = await executeDecision({ process, action, effectivePassword, remarks, footprintSession: session });
   } catch (error) {
-    // A concurrent edit holds the document open in SAP. Keep the link usable and
-    // ask the approver to retry once the editor is done.
-    if (error instanceof ApprovalDocumentLockedError) {
-      await releaseProcess(processId);
-      await markDecisionFailed(decisionLogId, 'document_locked');
-      logger.info('approval route: decision blocked by document lock', { processId });
-      return res.status(409).send(renderResultPage(DOCUMENT_LOCKED_PAGE));
-    }
-
-    // The stage was decided in SAP (add-on) between page load and submit —
-    // retire the link rather than releasing it for another attempt.
-    if (error instanceof ApprovalStageAdvancedError) {
-      await markProcessSuperseded(processId, error.meta?.reason || 'stage_advanced');
-      await markDecisionFailed(decisionLogId, `superseded:${error.meta?.reason || 'stage_advanced'}`);
-      logger.info('approval route: decision superseded by SAP add-on', {
-        processId,
-        reason: error.meta?.reason,
-        currentStage: error.meta?.currentStage,
-      });
-      return res.status(410).send(renderResultPage(ALREADY_DECIDED_PAGE));
-    }
-
-    // SAP rejected the password. Re-prompt for it: a wrong typed password just
-    // retries; a rejected stored password means it changed, so re-enroll.
+    // SAP rejected the password. Re-prompt: a wrong typed password just retries;
+    // a rejected stored password means it changed, so re-enroll. (The executor
+    // has already released the process.)
     if (error instanceof ApprovalInvalidCredentialsError) {
-      await releaseProcess(processId);
-      await markDecisionFailed(decisionLogId, enrollOnSuccess ? 'invalid_credentials_typed' : 'invalid_credentials_stored');
       logger.info('approval route: SAP rejected approver credentials — re-prompting', { processId, wasStored: !enrollOnSuccess });
       return res.status(200).send(
         renderDecisionPage({
           process,
           processId,
-          companyHash: currentCompanyHash(),
+          companyHash,
           needsPassword: true,
           messageKind: enrollOnSuccess ? 'error' : 'info',
           message: enrollOnSuccess
@@ -449,28 +343,33 @@ async function handleDecisionPost(req, res, action, processId, process) {
         })
       );
     }
-
-    if (error instanceof ApprovalSapError) {
-      logger.error('approval route: SAP decision failed', {
-        approvalRequestId: error.meta?.approvalRequestId,
-        decisionStatus: error.meta?.decisionStatus,
-        cause: error.meta?.cause,
-        message: error.message,
-      });
-    }
-
-    await releaseProcess(processId);
-    await markDecisionFailed(decisionLogId, error?.message || String(error), buildSapResponseForLog(error));
-
-    const status = error instanceof ApprovalUnauthorizedError ? 403 : 400;
-    return res.status(status).send(
-      renderDecisionPage({ process, processId, companyHash: currentCompanyHash(), message: toHumanMessage(error) })
-    );
+    throw error;
   }
 
-  // The decision went through with a freshly typed password — remember it
-  // (encrypted) so this approver won't be asked again. A storage failure must
-  // never undo the approval that already succeeded in SAP.
+  switch (outcome.outcome) {
+    case DECISION_OUTCOME.CLAIM_FAILED:
+      await auditFailure(outcome.reason);
+      logger.warn('approval route: process claim rejected decision', { processId, reason: outcome.reason });
+      return res.status(410).send(
+        renderResultPage({ title: 'Link No Longer Active', message: failureMessage(outcome.reason) })
+      );
+    case DECISION_OUTCOME.LOCKED:
+      logger.info('approval route: decision blocked by document lock', { processId });
+      return res.status(409).send(renderResultPage(DOCUMENT_LOCKED_PAGE));
+    case DECISION_OUTCOME.SUPERSEDED:
+      logger.info('approval route: decision superseded by SAP add-on', { processId, reason: outcome.reason });
+      return res.status(410).send(renderResultPage(ALREADY_DECIDED_PAGE));
+    case DECISION_OUTCOME.FAILED:
+      return res.status(outcome.unauthorized ? 403 : 400).send(
+        renderDecisionPage({ process, processId, companyHash, message: outcome.message })
+      );
+    default:
+      break;
+  }
+
+  // A freshly typed password that worked — remember it (encrypted) so this
+  // approver won't be asked again. A storage failure must never undo the approval
+  // that already succeeded in SAP.
   if (enrollOnSuccess) {
     try {
       await upsertApproverCredential(process.user_code, typedPassword);
@@ -483,83 +382,13 @@ async function handleDecisionPost(req, res, action, processId, process) {
     }
   }
 
-  await markProcessDecided(processId, action);
-
-  const after = result?.sapResponse?.after;
-  const draftDocEntry = after?.DraftEntry ?? result?.draftPost?.draftEntry ?? process.draft_entry ?? null;
-  // The final Sales Order DocEntry is either returned by SaveDraftToDocument, or
-  // exposed as the ApprovalRequest's ObjectEntry once IsDraft flips to 'N'.
-  const draftPostFinal = result?.draftPost?.success
-    ? result.draftPost.result?.DocEntry ?? result.draftPost.result?.docEntry ?? null
-    : null;
-  const objectEntryFinal = after && String(after.IsDraft) === 'N' && Number(after.ObjectEntry) > 0
-    ? Number(after.ObjectEntry)
-    : null;
-  const syncFinalDocEntry = draftPostFinal ?? objectEntryFinal;
-
-  await markDecisionSuccess(decisionLogId, {
-    sapResponse: result?.sapResponse ?? null,
-    timezone: session.timezone,
-    draftDocEntry,
-    finalDocEntry: syncFinalDocEntry,
-  });
-
-  // Surface the approver's remark in SAP's Approval Status Report (WDD1.Remarks).
-  // The Service Layer writes it only intermittently, so it is written directly
-  // and deterministically here for this approver's line.
-  const remarkText = (req.body?.remarks || '').trim();
-  if (remarkText) {
-    await writeDecisionRemark({
-      approvalRequestId: process.approval_request_id,
-      sapUserId: process.sap_user_id,
-      remark: remarkText,
-    });
-  }
-
-  // Once the FINAL level approves and the draft becomes a Sales Order, record on
-  // each of this request's footprints which document it belongs to (DocEntry +
-  // DocNum) and whether that document was newly CREATED or an existing one
-  // UPDATED. The CREATED/UPDATED signal must be read from the pre-decision
-  // snapshot: after conversion SAP sets ObjectEntry for new orders too, so it no
-  // longer distinguishes the two.
-  const changeType = getSalesOrderChangeStatus(result?.sapResponse?.before).code;
-
-  if (action === ACTIONS.APPROVE && result?.currentStatus === 'arsApproved') {
-    if (syncFinalDocEntry != null) {
-      linkApprovalFootprintsToDocument({
-        approvalRequestId: process.approval_request_id,
-        docEntry: syncFinalDocEntry,
-        changeType,
-      }).catch(() => {});
-    } else {
-      // Vendor add-on converts a few seconds later — fill final_doc_entry from the
-      // ApprovalRequest's ObjectEntry once it appears, and link the footprints then.
-      scheduleFinalDocReconciliation({
-        decisionLogId,
-        approvalRequestId: process.approval_request_id,
-        draftDocEntry,
-        company: currentCompany(),
-        onResolved: (docEntry) =>
-          linkApprovalFootprintsToDocument({
-            approvalRequestId: process.approval_request_id,
-            docEntry,
-            changeType,
-          }),
-      });
-    }
-  }
-
-  const draftPostWarning =
-    result?.draftPost?.attempted && result.draftPost.success === false
-      ? result.draftPost.error ||
-        'Approval succeeded, but the approved draft could not be posted. Manual or automatic retry is required.'
-      : '';
-
   return res.status(200).send(
     renderResultPage({
       title: action === ACTIONS.APPROVE ? 'Approval Completed' : 'Rejection Completed',
-      message: `Request ${result.approvalRequestId} was processed successfully.`,
-      details: [`Current SAP status: ${result.currentStatus ?? 'unknown'}`, draftPostWarning].filter(Boolean).join(' '),
+      message: `Request ${outcome.approvalRequestId} was processed successfully.`,
+      details: [`Current SAP status: ${outcome.currentStatus ?? 'unknown'}`, outcome.draftPostWarning]
+        .filter(Boolean)
+        .join(' '),
     })
   );
 }

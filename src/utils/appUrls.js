@@ -27,8 +27,31 @@ export function companyFootprintClientPath(companyHash) {
   return `${companyPath(companyHash)}/footprint/client.js`;
 }
 
+/** Bulk digest page for one approver, e.g. '/salesorder/api/v1/c/<hash>/queue/<token>'. */
+export function companyQueuePath(companyHash, digestToken) {
+  return `${companyPath(companyHash)}/queue/${digestToken}`;
+}
+
+/** Footprint register endpoint for the bulk digest page (token-scoped). */
+export function companyQueueFootprintRegisterPath(companyHash, digestToken) {
+  return `${companyQueuePath(companyHash, digestToken)}/footprint/register`;
+}
+
+/** The bulk digest page's browser client script (company-scoped, static). */
+export function companyQueueClientPath(companyHash) {
+  return `${companyPath(companyHash)}/queue/client.js`;
+}
+
 /** Absolute action URL for the email button: origin + base path + action route. */
 export function absoluteActionUrl(companyHash, processId) {
-  const origin = String(config.appBaseUrl ?? '').replace(/\/+$/, '');
-  return `${origin}${companyActionPath(companyHash, processId)}`;
+  return `${absoluteOrigin()}${companyActionPath(companyHash, processId)}`;
+}
+
+/** Absolute bulk digest URL for the digest email's "Take Action" button. */
+export function absoluteQueueUrl(companyHash, digestToken) {
+  return `${absoluteOrigin()}${companyQueuePath(companyHash, digestToken)}`;
+}
+
+function absoluteOrigin() {
+  return String(config.appBaseUrl ?? '').replace(/\/+$/, '');
 }

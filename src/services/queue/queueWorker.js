@@ -3,31 +3,18 @@ import { config } from '../../config/index.js';
 import { listCompanies, runInCompany, currentSL, currentCompany } from '../company/companyContext.js';
 import { queueStore as backendQueueStore } from './queueStore.js';
 import { sendApprovalEmail } from '../email/approvalEmailService.js';
-import { ApprovalService, LINE_STATUS, postApprovedDraft } from '../sap/approvalService.js';
+import { ApprovalService, postApprovedDraft } from '../sap/approvalService.js';
+import {
+  PENDING_APPROVALS_PATH,
+  APPROVED_DRAFTS_PATH,
+  isBeforeCreatedCutoff,
+  getActionableApprovers,
+  getAllPages,
+} from '../sap/approvalRequestQueries.js';
 
 const POLL_INTERVAL_MS = 30_000;
 const EMAIL_MAX_SEND_ATTEMPTS = 5;
 const EMAIL_RETRY_BACKOFF_MINUTES = 2;
-
-const PENDING_APPROVALS_PATH =
-  "/ApprovalRequests?$filter=Status%20eq%20'arsPending'%20and%20ObjectType%20eq%20'17'%20and%20IsDraft%20eq%20'Y'" +
-  '&$select=Code,Status,CurrentStage,ObjectType,IsDraft,ObjectEntry,DraftEntry,CreationDate,ApprovalRequestLines';
-
-const APPROVED_DRAFTS_PATH =
-  "/ApprovalRequests?$filter=Status%20eq%20'arsApproved'%20and%20ObjectType%20eq%20'17'%20and%20IsDraft%20eq%20'Y'" +
-  '&$select=Code,Status,CurrentStage,ObjectType,IsDraft,ObjectEntry,DraftEntry,CreationDate';
-
-// An approval request is only handled when the SO was punched or updated on/after
-// this date (its ApprovalRequest.CreationDate). Editing a draft mints a new
-// request dated to the edit, so this catches both "punched" and "updated". A
-// null cutoff (injected tests) disables the filter.
-function isBeforeCreatedCutoff(creationDate, cutoffDate) {
-  if (!cutoffDate) {
-    return false;
-  }
-  const created = String(creationDate ?? '').slice(0, 10);
-  return created < cutoffDate;
-}
 
 const createDefaultQueueStore = () => ({
   async getKnownApprovalStageKeys() {
@@ -54,33 +41,6 @@ const createDefaultQueueStore = () => ({
 });
 
 const createDefaultLogger = () => logger;
-
-export function getActionableApprovers(approvalRequest) {
-  const lines = approvalRequest.ApprovalRequestLines || [];
-  for (const [index, line] of lines.entries()) {
-    if (Number(line.StageCode) !== Number(approvalRequest.CurrentStage)) {
-      continue;
-    }
-
-    if (line.Status !== LINE_STATUS.PENDING) {
-      continue;
-    }
-
-    const priorPending = lines.slice(0, index).some(
-      (previousLine) =>
-        Number(previousLine.StageCode) === Number(approvalRequest.CurrentStage) &&
-        previousLine.Status === LINE_STATUS.PENDING
-    );
-
-    if (priorPending) {
-      break;
-    }
-
-    return [{ ...line, approverPosition: index + 1 }];
-  }
-
-  return [];
-}
 
 function buildStageKey(approvalRequestId, currentStage) {
   return `${String(approvalRequestId ?? '')}:${String(currentStage ?? '')}`;
@@ -193,33 +153,12 @@ export function createQueueWorker({
     }
   }
 
-  // The SAP Service Layer paginates OData results (default 20 per page). Follow
-  // @odata.nextLink so EVERY pending request is fetched, not just the first page
-  // — otherwise, with a backlog larger than one page, the newest requests never
-  // surface until older ones are cleared (they appear to trickle in one by one).
-  async function getAllPages(firstPath) {
-    const all = [];
-    let path = firstPath;
-    let guard = 0;
-    while (path && guard < 500) {
-      guard += 1;
-      const response = await resolveSession().client.get(path);
-      const data = response?.data ?? response ?? {};
-      const page = Array.isArray(data) ? data : data.value ?? [];
-      all.push(...page);
-      const next = data['@odata.nextLink'] ?? data['odata.nextLink'] ?? null;
-      if (!next) break;
-      path = /^https?:\/\//i.test(next) ? next : `/${String(next).replace(/^\/+/, '')}`;
-    }
-    return all;
-  }
-
   async function fetchPendingApprovalRequests() {
     await resolveSession().ensureLoggedIn();
 
     try {
       workerLogger.info('queueWorker: polling SAP approval requests');
-      const pending = await getAllPages(PENDING_APPROVALS_PATH);
+      const pending = await getAllPages(resolveSession(), PENDING_APPROVALS_PATH);
       workerLogger.info('queueWorker: SAP poll completed', { count: pending.length });
       return pending;
     } catch (error) {
@@ -236,7 +175,7 @@ export function createQueueWorker({
 
     try {
       workerLogger.info('queueWorker: polling SAP approved draft requests');
-      const approved = await getAllPages(APPROVED_DRAFTS_PATH);
+      const approved = await getAllPages(resolveSession(), APPROVED_DRAFTS_PATH);
       workerLogger.info('queueWorker: approved draft poll completed', { count: approved.length });
       return approved;
     } catch (error) {
@@ -559,4 +498,6 @@ export const queueWorker = createQueueWorker({
 export const { pollOnce, start, stop, fetchPendingApprovalRequests, fetchApprovedDraftRequests, processApprovedDrafts } =
   queueWorker;
 export const queueStore = backendQueueStore;
+// Re-exported for backward compatibility with earlier import sites.
+export { getActionableApprovers };
 export default queueWorker;

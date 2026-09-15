@@ -52,6 +52,31 @@ export function parseCutoffDate(raw) {
   return date;
 }
 
+/**
+ * Parse the digest recipient allowlist (comma-separated emails). During rollout
+ * the daily digest is delivered ONLY to these addresses; everyone else is
+ * skipped. Normalized to lowercase, de-duplicated, blanks dropped.
+ *
+ * @param {string} raw
+ * @returns {ReadonlyArray<string>}
+ */
+/** Parse an integer env value, falling back when it is unset/blank/non-numeric. */
+export function intOrFallback(raw, fallback) {
+  const n = Number.parseInt(raw, 10);
+  return Number.isFinite(n) ? n : fallback;
+}
+
+export function parseDigestAllowlist(raw) {
+  const seen = new Set();
+  for (const entry of String(raw ?? '').split(',')) {
+    const email = entry.trim().toLowerCase();
+    if (email) {
+      seen.add(email);
+    }
+  }
+  return Object.freeze([...seen]);
+}
+
 export function parseCompanies(companiesCsv, { fallbackSchema, fallbackCompanyDb } = {}) {
   const companies = String(companiesCsv || '')
     .split(',')
@@ -139,6 +164,25 @@ const env = validateEnv([
   { key: 'APPROVAL_MIN_CREATED_DATE', default: '2026-09-10' },
   // Blind-copied on every approval email (monitoring). Empty = no BCC.
   { key: 'EMAIL_BCC', default: 'sap1@matangiindustries.com' },
+  // Scheduled daily digest of pending approvals (bulk approve/reject page).
+  { key: 'DIGEST_ENABLED', default: 'true', allowed: ['true', 'false'] },
+  // Global default send time (IST). Per-stage times below fall back to this when
+  // their own value is not set.
+  { key: 'DIGEST_SEND_HOUR_IST', parse: 'int', default: 10 },
+  { key: 'DIGEST_SEND_MINUTE_IST', parse: 'int', default: 0 },
+  // Per-stage send times (IST): approvers currently at the first approval stage
+  // are digested at STAGE1, those at the second stage at STAGE2. Left blank here
+  // so they are set in .env; blank falls back to the global time above.
+  { key: 'DIGEST_STAGE1_SEND_HOUR_IST', default: '' },
+  { key: 'DIGEST_STAGE1_SEND_MINUTE_IST', default: '' },
+  { key: 'DIGEST_STAGE2_SEND_HOUR_IST', default: '' },
+  { key: 'DIGEST_STAGE2_SEND_MINUTE_IST', default: '' },
+  // During rollout the digest is delivered ONLY to these addresses. Set in .env
+  // (DIGEST_ALLOWLIST); empty here so no recipient is ever hardcoded in source —
+  // an unset allowlist means the digest sends to no one (fail-safe).
+  { key: 'DIGEST_ALLOWLIST', default: '' },
+  // How long a digest "Take Action" link stays valid after it is sent.
+  { key: 'DIGEST_TOKEN_TTL_HOURS', parse: 'int', default: 36 },
   { key: 'RATE_LIMIT_WINDOW_MS', parse: 'int', default: 15 * 60 * 1000 },
   { key: 'RATE_LIMIT_MAX', parse: 'int', default: 100 },
   { key: 'CORS_ORIGIN', default: '*' },
@@ -201,6 +245,28 @@ export const config = {
   emailAllowlistUntil: parseCutoffDate(env.EMAIL_ALLOWLIST_UNTIL),
   approvalMinCreatedDate: env.APPROVAL_MIN_CREATED_DATE,
   emailBcc: env.EMAIL_BCC,
+  digest: {
+    enabled: env.DIGEST_ENABLED === 'true',
+    sendHourIst: env.DIGEST_SEND_HOUR_IST,
+    sendMinuteIst: env.DIGEST_SEND_MINUTE_IST,
+    allowlist: parseDigestAllowlist(env.DIGEST_ALLOWLIST),
+    tokenTtlHours: env.DIGEST_TOKEN_TTL_HOURS,
+    // One send time per approval stage. Approvers currently at stage N are
+    // digested at stageSchedules[N-1]'s time. A per-stage value left blank in
+    // .env falls back to the global DIGEST_SEND_* time.
+    stageSchedules: [
+      {
+        stage: 1,
+        hour: intOrFallback(env.DIGEST_STAGE1_SEND_HOUR_IST, env.DIGEST_SEND_HOUR_IST),
+        minute: intOrFallback(env.DIGEST_STAGE1_SEND_MINUTE_IST, env.DIGEST_SEND_MINUTE_IST),
+      },
+      {
+        stage: 2,
+        hour: intOrFallback(env.DIGEST_STAGE2_SEND_HOUR_IST, env.DIGEST_SEND_HOUR_IST),
+        minute: intOrFallback(env.DIGEST_STAGE2_SEND_MINUTE_IST, env.DIGEST_SEND_MINUTE_IST),
+      },
+    ],
+  },
   companies,
   companyHashSecret: env.JWT_SECRET,
   hana: {

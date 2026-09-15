@@ -1,6 +1,7 @@
 import express from 'express';
 import approvalRouter from './approval.js';
 import footprintRouter from './footprint.js';
+import queueRouter from './queue.js';
 import healthRouter from './health.js';
 import { getCompanyByHash, runInCompany } from '../services/company/companyContext.js';
 
@@ -30,6 +31,7 @@ function companyScope(req, res, next) {
 
 const companyRouter = express.Router({ mergeParams: true });
 companyRouter.use('/', footprintRouter);
+companyRouter.use('/', queueRouter);
 companyRouter.use('/', approvalRouter);
 
 router.use('/c/:companyHash', companyScope, companyRouter);

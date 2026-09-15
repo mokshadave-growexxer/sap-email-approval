@@ -1,5 +1,5 @@
-import nodemailer from 'nodemailer';
 import { config } from '../../config/index.js';
+import { getCompanyTransporter, resolveBccRecipient } from './mailer.js';
 import { createProcess, getProcess, PROCESS_STATUS } from '../approval/processStore.js';
 import { getDraftAttachments } from '../sap/attachmentService.js';
 import { getSalesOrderChangeStatus } from '../sap/draftStatusService.js';
@@ -52,18 +52,6 @@ export function buildApprovalSubject(docNum, docDate) {
   return date ? `${base} / ${date}` : base;
 }
 
-/** The monitoring BCC address for a send, or undefined when unset or equal to the recipient. */
-export function resolveBccRecipient(recipientEmail) {
-  const bcc = config.emailBcc;
-  if (!bcc) {
-    return undefined;
-  }
-  if (String(recipientEmail || '').trim().toLowerCase() === String(bcc).trim().toLowerCase()) {
-    return undefined;
-  }
-  return bcc;
-}
-
 /**
  * Resolve the approver's SAP UserCode (login name) and email from the SAP Users
  * entity. UserCode is what the server later logs in with; email is where the
@@ -97,24 +85,6 @@ const DEV_TEST_APPROVER_MAP = Object.freeze({
   1: { name: 'Stage 1 Approver', email: 'sap1@matangiindustries.com' },
   2: { name: 'Stage 2 Approver', email: 'moksha.dave@growexx.com' },
 });
-
-// One SMTP transport per company sender, built lazily and cached by company key.
-// Each company mails from its own configured identity (e.g. MILLP from
-// approval@matangiindustries.com, MSPL from approval@minalspecialities.com).
-const transportersByCompany = new Map();
-function getTransporter(companyKey, smtp) {
-  let transporter = transportersByCompany.get(companyKey);
-  if (!transporter) {
-    transporter = nodemailer.createTransport({
-      host: smtp.host,
-      port: smtp.port,
-      secure: smtp.port === 465,
-      auth: { user: smtp.user, pass: smtp.pass },
-    });
-    transportersByCompany.set(companyKey, transporter);
-  }
-  return transporter;
-}
 
 function assertEmailConfig(smtp) {
   if (!config.appBaseUrl) {
@@ -651,7 +621,7 @@ export async function sendApprovalEmail({ approvalRequestId, approverUserId, app
   });
 
   try {
-    const result = await getTransporter(company.key, smtp).sendMail({
+    const result = await getCompanyTransporter(company.key, smtp).sendMail({
       from: smtp.from,
       to: recipientEmail,
       bcc: resolveBccRecipient(recipientEmail),
@@ -693,4 +663,6 @@ export {
   buildApprovalHistoryHtml,
   resolveApproverContact,
   resolveDraftEmailData,
+  resolveSapUser,
+  resolveBccRecipient,
 };

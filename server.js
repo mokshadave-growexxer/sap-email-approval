@@ -3,6 +3,18 @@ import app from './src/app.js';
 import { config } from './src/config/index.js';
 import logger from './src/config/logger.js';
 import { queueWorker } from './src/services/queue/queueWorker.js';
+import { createDigestScheduler } from './src/services/digest/digestScheduler.js';
+import { runDigestAllCompanies } from './src/services/digest/digestService.js';
+
+// One scheduler per approval stage: each fires at its own IST time and sends only
+// the SOs currently awaiting that stage's approver.
+const digestSchedulers = config.digest.stageSchedules.map((stageSchedule) =>
+  createDigestScheduler({
+    hour: stageSchedule.hour,
+    minute: stageSchedule.minute,
+    runFn: () => runDigestAllCompanies({ stageFilter: stageSchedule.stage }),
+  })
+);
 
 process.on('uncaughtException', (error) => {
   logger.error('Uncaught exception detected', {
@@ -38,6 +50,7 @@ const startServer = () => {
   }
 
   queueWorker.start();
+  digestSchedulers.forEach((scheduler) => scheduler.start());
 
   server.on('error', (error) => {
     logger.error('Server failed to start', {
@@ -52,6 +65,7 @@ startServer();
 
 process.on('SIGINT', () => {
   queueWorker.stop();
+  digestSchedulers.forEach((scheduler) => scheduler.stop());
   if (server) {
     server.close(() => process.exit(0));
   } else {
