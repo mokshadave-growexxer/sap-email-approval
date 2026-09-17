@@ -8,7 +8,7 @@ import {
   getAllPages,
 } from '../sap/approvalRequestQueries.js';
 import { getSalesOrderChangeStatus } from '../sap/draftStatusService.js';
-import { createProcess } from '../approval/processStore.js';
+import { createProcess, getRecordedLevelsByRequestAndUser } from '../approval/processStore.js';
 import { resolveDraftEmailData, resolveSapUser, buildApprovalHistory } from '../email/approvalEmailService.js';
 import { sendDigestEmail } from '../email/digestEmailService.js';
 import { signDigestToken } from '../../utils/digestToken.js';
@@ -25,7 +25,10 @@ import { absoluteQueueUrl } from '../../utils/appUrls.js';
  * @param {{ createdCutoff?: string|null }} [opts]
  * @returns {Map<string, Array<object>>} approverUserId -> actionable items.
  */
-export function groupActionableByApprover(pendingRequests, { createdCutoff = null, stageFilter = null } = {}) {
+export function groupActionableByApprover(
+  pendingRequests,
+  { createdCutoff = null, stageFilter = null, levelsByKey = null } = {}
+) {
   const byApprover = new Map();
   for (const req of pendingRequests || []) {
     const approvalRequestId = req.Code ?? req.Id ?? req.approvalRequestId;
@@ -53,7 +56,14 @@ export function groupActionableByApprover(pendingRequests, { createdCutoff = nul
       // per-stage send times target. It works whether approvers sit on distinct
       // SAP StageCodes OR are sequential lines within a single StageCode — unlike
       // keying off the raw StageCode, which collapses same-code approvers together.
-      const stageNumber = line.approverPosition ?? null;
+      //
+      // Prefer the level recorded in @AP_APPROVAL (U_level) when one exists: it was
+      // captured once, when the instant channel first queued this approver for this
+      // request, so it can't drift from a live recomputation against SAP's current
+      // ApprovalRequestLines. Only fall back to a fresh computation when no row has
+      // been recorded yet (e.g. the request became actionable after the last poll).
+      const recordedLevel = levelsByKey?.get(`${String(approvalRequestId)}:${String(approverUserId)}`);
+      const stageNumber = recordedLevel ?? line.approverPosition ?? null;
 
       // When a stage filter is set (a per-stage scheduled send), only include SOs
       // currently awaiting that stage's approver.
@@ -242,9 +252,11 @@ export async function runDigestForCompany({ stageFilter = null } = {}) {
   await session.ensureLoggedIn();
 
   const pending = await getAllPages(session, PENDING_APPROVALS_PATH);
+  const levelsByKey = await getRecordedLevelsByRequestAndUser();
   const byApprover = groupActionableByApprover(pending, {
     createdCutoff: config.approvalMinCreatedDate ?? null,
     stageFilter,
+    levelsByKey,
   });
 
   let sent = 0;

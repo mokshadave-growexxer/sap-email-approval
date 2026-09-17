@@ -51,6 +51,26 @@ export async function getActiveApprovalProcesses() {
   }));
 }
 
+/**
+ * U_level recorded for every locally-known (request, approver) pair still
+ * pending/processing, keyed "requestId:sapUserId". This is the level captured
+ * ONCE — when the instant channel first enqueued the approval — so the daily
+ * digest can trust it instead of re-deriving the stage from SAP's live
+ * ApprovalRequestLines on every run (which can disagree with the original
+ * computation once a request has moved through multiple stages).
+ */
+export async function getRecordedLevelsByRequestAndUser() {
+  const rows = await query(
+    `SELECT "U_request_id","U_sap_user_id","U_level" FROM ${T()} WHERE "U_status" IN ('pending','processing')`
+  );
+  const map = new Map();
+  for (const r of rows) {
+    if (r.U_level == null) continue;
+    map.set(`${String(r.U_request_id ?? '')}:${String(r.U_sap_user_id ?? '')}`, toIntOrNull(r.U_level));
+  }
+  return map;
+}
+
 export async function getKnownApprovalStageKeys() {
   const rows = await query(
     `SELECT "U_request_id","U_stage","U_sap_user_id" FROM ${T()} WHERE "U_status" IN ('pending','processing')`

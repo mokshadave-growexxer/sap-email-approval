@@ -76,6 +76,26 @@ test('no stageFilter includes every stage', () => {
   assert.equal(byApprover.size, 2);
 });
 
+test('a recorded @AP_APPROVAL level overrides the recomputed approverPosition', () => {
+  // Request 202's actionable approver (UserID 22) would recompute to position 2,
+  // but the level recorded when the instant channel first queued it says 1 —
+  // e.g. it was queued before the request picked up an earlier approved line.
+  // The recorded level must win so the stage-1 scheduler catches it, not stage-2.
+  const levelsByKey = new Map([['202:22', 1]]);
+
+  const stage1 = groupActionableByApprover(pending(), { createdCutoff: null, stageFilter: 1, levelsByKey });
+  assert.deepEqual(
+    stage1.get('22')?.map((i) => i.approvalRequestId),
+    [202]
+  );
+
+  const stage2 = groupActionableByApprover(pending(), { createdCutoff: null, stageFilter: 2, levelsByKey });
+  assert.deepEqual(
+    stage2.get('22')?.map((i) => i.approvalRequestId),
+    [203]
+  );
+});
+
 test('intOrFallback parses ints and falls back on blank/non-numeric', () => {
   assert.equal(intOrFallback('4', 9), 4);
   assert.equal(intOrFallback('', 9), 9);

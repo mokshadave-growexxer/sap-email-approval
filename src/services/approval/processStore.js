@@ -8,4 +8,5 @@ export {
   releaseProcess,
   markProcessSuperseded,
   getApprovedProcessesForRequest,
+  getRecordedLevelsByRequestAndUser,
 } from './hanaApprovalStore.js';
