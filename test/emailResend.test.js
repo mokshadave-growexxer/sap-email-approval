@@ -165,6 +165,106 @@ test('allowlist-skipped email is marked skipped and never retried', async () => 
   assert.equal(sends, 1);
 });
 
+// Mirrors the HANA store: a row created by the Pending approvals page has NO
+// stage, so its stage key never matches the poller's, while enqueue() reuses
+// the live row by request + approver. getSentApproverKeys is the send-once guard.
+function hanaLikeStore({ withSentGuard = true } = {}) {
+  const store = memQueueStore();
+  const enqueueNew = store.enqueue;
+  store.enqueue = async (item) => {
+    for (const r of store.rows.values()) {
+      if (String(r.approval_request_id) === String(item.approvalRequestId) && String(r.approver_user_id) === String(item.approverUserId)) {
+        return r.id;
+      }
+    }
+    return enqueueNew(item);
+  };
+  if (withSentGuard) {
+    store.getSentApproverKeys = async () =>
+      new Set([...store.rows.values()].filter((r) => r.status === 'sent').map((r) => `${r.approval_request_id}:${r.approver_user_id}`));
+  }
+  return store;
+}
+
+function seedPageCreatedRow(store, status = 'pending') {
+  store.rows.set(1, {
+    id: 1,
+    approval_request_id: 500,
+    current_stage: null, // created by the Pending approvals page: no stage
+    approver_user_id: 3,
+    approver_position: 1,
+    draft_entry: 55,
+    process_id: null,
+    status,
+    attempts: 0,
+    last_error: null,
+  });
+}
+
+test('a stage-less row (opened via Pending approvals page) is emailed once, never on every poll', async () => {
+  const store = hanaLikeStore();
+  seedPageCreatedRow(store);
+  let sends = 0;
+  const worker = createQueueWorker({
+    queueStore: store,
+    sapSessionManager: sapWithOnePendingApprover(),
+    logger: silentLogger,
+    postApprovedDraftFn: async () => ({}),
+    onNewApprovalQueued: async () => {
+      sends += 1;
+      return { processId: 'proc-1' };
+    },
+  });
+
+  for (let i = 0; i < 5; i += 1) await worker.pollOnce();
+
+  assert.equal(sends, 1);
+  assert.equal(store.rows.get(1).status, 'sent');
+});
+
+test('without the send-once guard the stage-less row WAS re-sent every poll (the bug)', async () => {
+  const store = hanaLikeStore({ withSentGuard: false });
+  seedPageCreatedRow(store);
+  let sends = 0;
+  const worker = createQueueWorker({
+    queueStore: store,
+    sapSessionManager: sapWithOnePendingApprover(),
+    logger: silentLogger,
+    postApprovedDraftFn: async () => ({}),
+    onNewApprovalQueued: async () => {
+      sends += 1;
+      return { processId: 'proc-1' };
+    },
+  });
+
+  for (let i = 0; i < 3; i += 1) await worker.pollOnce();
+
+  assert.equal(sends, 3, 'reproduces the duplicate-email loop the guard prevents');
+});
+
+test('a failed row is not retried when the approver was already emailed for that request', async () => {
+  const store = hanaLikeStore();
+  seedPageCreatedRow(store, 'sent');
+  store.rows.set(2, { ...store.rows.get(1), id: 2, current_stage: 1, status: 'failed', attempts: 1 });
+  let sends = 0;
+  const worker = createQueueWorker({
+    queueStore: store,
+    sapSessionManager: sapWithOnePendingApprover(),
+    logger: silentLogger,
+    postApprovedDraftFn: async () => ({}),
+    onNewApprovalQueued: async () => {
+      sends += 1;
+      return { processId: 'proc-1' };
+    },
+  });
+
+  await worker.pollOnce();
+
+  assert.equal(sends, 0);
+  assert.equal(store.rows.get(2).status, 'skipped');
+  assert.equal(store.rows.get(2).last_error, 'already_sent');
+});
+
 test('retries stop after the max attempt cap', async () => {
   const store = memQueueStore();
   let sends = 0;

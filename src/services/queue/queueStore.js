@@ -3,6 +3,7 @@ import * as hana from '../approval/hanaApprovalStore.js';
 
 export const queueStore = {
   getKnownApprovalStageKeys: (...a) => hana.getKnownApprovalStageKeys(...a),
+  getSentApproverKeys: (...a) => hana.getSentApproverKeys(...a),
   enqueue: (...a) => hana.enqueue(...a),
   getPendingItems: (...a) => hana.getPendingItems(...a),
   markProcessing: (...a) => hana.markProcessing(...a),

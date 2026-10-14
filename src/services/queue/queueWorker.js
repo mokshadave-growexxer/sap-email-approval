@@ -57,6 +57,10 @@ function isKnownApprovalStage(knownStageKeys, approvalRequestId, currentStage, a
   return knownStageKeys.has(buildApprovalKey(approvalRequestId, currentStage, approverUserId));
 }
 
+function buildSentKey(approvalRequestId, approverUserId) {
+  return `${String(approvalRequestId ?? '')}:${String(approverUserId ?? '')}`;
+}
+
 function buildPostedDraftKey(companyDb, approvalRequestId, draftEntry) {
   return `${String(companyDb ?? '')}:${String(approvalRequestId ?? '')}:${String(draftEntry ?? '')}`;
 }
@@ -290,6 +294,13 @@ export function createQueueWorker({
     }
   }
 
+  // Approvers already emailed per request ("requestId:sapUserId"). Optional on
+  // the store so injected test stores without it behave as before.
+  async function loadSentApproverKeys() {
+    if (typeof queueStore.getSentApproverKeys !== 'function') return new Set();
+    return new Set([...(await queueStore.getSentApproverKeys())].map((value) => String(value)));
+  }
+
   async function pollPendingApprovals() {
     let pendingRequests;
     try {
@@ -313,6 +324,7 @@ export function createQueueWorker({
     const baseline = resolveBaseline(pendingRequests);
     const createdCutoff = resolveCreatedCutoff();
     const known = new Set([...(await queueStore.getKnownApprovalStageKeys())].map((value) => String(value)));
+    const sent = await loadSentApproverKeys();
     workerLogger.info('queueWorker: processing pending approvals', {
       pendingCount: pendingRequests.length,
       knownCount: known.size,
@@ -348,6 +360,12 @@ export function createQueueWorker({
             continue;
           }
 
+          // Send once, strictly: an approver already emailed for this request is
+          // never emailed again, even if their row lost its stage.
+          if (sent.has(buildSentKey(approvalRequestId, approverUserId))) {
+            continue;
+          }
+
           if (isKnownApprovalStage(known, approvalRequestId, currentStage, approverUserId)) {
             workerLogger.info('queueWorker: approval already known, skipping email', {
               approvalRequestId,
@@ -359,6 +377,7 @@ export function createQueueWorker({
 
           const queueId = await queueStore.enqueue(item);
           known.add(buildApprovalKey(approvalRequestId, currentStage, approverUserId));
+          sent.add(buildSentKey(approvalRequestId, approverUserId));
           workerLogger.info('queueWorker: enqueued new approval', item);
           await attemptSend(queueId, item);
         } catch (error) {
@@ -433,8 +452,14 @@ export function createQueueWorker({
     }
 
     workerLogger.info('queueWorker: retrying failed approval emails', { count: items.length });
+    const sent = await loadSentApproverKeys();
 
     for (const row of items) {
+      // Never retry an email this approver has already received for the request.
+      if (sent.has(buildSentKey(row.approval_request_id, row.approver_user_id))) {
+        await queueStore.markSkipped(row.id, 'already_sent');
+        continue;
+      }
       const item = {
         approvalRequestId: row.approval_request_id,
         currentStage: row.current_stage,

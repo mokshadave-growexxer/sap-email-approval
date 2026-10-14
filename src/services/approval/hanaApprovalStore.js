@@ -80,6 +80,20 @@ export async function getKnownApprovalStageKeys() {
   );
 }
 
+/**
+ * "requestId:sapUserId" for every approver who has ALREADY been sent the
+ * approval email for that SAP approval request — whatever the row's stage or
+ * status. This is the send-once guard: getKnownApprovalStageKeys matches on the
+ * stage too, and a row created by the Pending approvals / digest page has no
+ * stage, so without this the poller re-sent that email on every 30s cycle.
+ */
+export async function getSentApproverKeys() {
+  const rows = await query(
+    `SELECT DISTINCT "U_request_id","U_sap_user_id" FROM ${T()} WHERE "U_email_status" = 'sent'`
+  );
+  return new Set(rows.map((r) => `${String(r.U_request_id ?? '')}:${String(r.U_sap_user_id ?? '')}`));
+}
+
 export async function enqueue({ approvalRequestId, currentStage, approverUserId, approverPosition, draftEntry }) {
   const existing = await findActiveRow(approvalRequestId, approverUserId);
   if (existing) return existing.Code;
