@@ -2,6 +2,7 @@ import express from 'express';
 import approvalRouter from './approval.js';
 import footprintRouter from './footprint.js';
 import queueRouter from './queue.js';
+import draftRetryRouter from './draftRetry.js';
 import healthRouter from './health.js';
 import { getCompanyByHash, runInCompany } from '../services/company/companyContext.js';
 
@@ -31,6 +32,7 @@ function companyScope(req, res, next) {
 
 const companyRouter = express.Router({ mergeParams: true });
 companyRouter.use('/', footprintRouter);
+companyRouter.use('/', draftRetryRouter);
 companyRouter.use('/', queueRouter);
 companyRouter.use('/', approvalRouter);
 

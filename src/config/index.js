@@ -199,6 +199,16 @@ const env = validateEnv([
   { key: 'SMTP_USER', default: '' },
   { key: 'SMTP_PASS', default: '' },
   { key: 'SMTP_FROM', default: '' },
+  // --- Approved-draft posting guard ---
+  // Where the restart-durable record of posted/parked drafts is kept. This is
+  // what stops a draft that can never post from burning one SAP DocEntry on
+  // every 30s poll cycle. Relative paths resolve against the app root.
+  { key: 'DRAFT_POST_STATE_DIR', default: './data' },
+  // Who is told when a draft is parked (it will NOT post again without a human,
+  // so this alert is the safety net). Deliberately independent of EMAIL_BCC and
+  // the rollout allowlists: an operational alert must never be redirected or
+  // suppressed by the approver-email delivery rules.
+  { key: 'DRAFT_POST_ALERT_TO', default: 'sap1@matangiindustries.com' },
 ]);
 
 const globalSmtp = {
@@ -266,6 +276,10 @@ export const config = {
         minute: intOrFallback(env.DIGEST_STAGE2_SEND_MINUTE_IST, env.DIGEST_SEND_MINUTE_IST),
       },
     ],
+  },
+  draftPost: {
+    stateDir: path.resolve(__dirname, '../..', env.DRAFT_POST_STATE_DIR),
+    alertTo: env.DRAFT_POST_ALERT_TO,
   },
   companies,
   companyHashSecret: env.JWT_SECRET,

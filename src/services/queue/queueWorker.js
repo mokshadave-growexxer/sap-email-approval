@@ -10,7 +10,10 @@ import {
   isBeforeCreatedCutoff,
   getActionableApprovers,
   getAllPages,
+  lookupConvertedDocEntry,
 } from '../sap/approvalRequestQueries.js';
+import { draftPostGuard as realDraftPostGuard, passthroughDraftPostGuard } from '../sap/draftPostGuard.js';
+import { sendParkedDraftAlert } from '../email/draftPostAlert.js';
 
 const POLL_INTERVAL_MS = 30_000;
 const EMAIL_MAX_SEND_ATTEMPTS = 5;
@@ -74,6 +77,11 @@ export function createQueueWorker({
   resolveBaselineFn = null,
   resolveCreatedCutoffFn = null,
   confirmDecisionEligibility = null,
+  // Bounds how often a draft may be POSTed. An injected session means a unit
+  // test with no company context or state directory, so the guard falls back to
+  // a pass-through there and the raw post path is exercised exactly as before.
+  draftPostGuard = injectedSessionManager ? passthroughDraftPostGuard : realDraftPostGuard,
+  onDraftParked = sendParkedDraftAlert,
 } = {}) {
   let pollTimer = null;
   /** @type {Set<string>} Drafts successfully posted in this process (avoid re-POSTing every poll). Keyed by company. */
@@ -232,21 +240,51 @@ export function createQueueWorker({
         continue;
       }
 
+      // Every post goes through the guard: SAP keeps the DocEntry it allocates
+      // even when the add rolls back, so an unconditional re-POST here burned
+      // one Sales Order number per draft per poll cycle (~2,880 a day each).
+      // The guard posts at most once per real opportunity and parks a draft
+      // that cannot succeed, instead of retrying it forever.
       try {
-        const salesOrder = await postApprovedDraftFn(resolveSession(), draftEntry);
-        postedDraftKeys.add(postedKey);
-        workerLogger.info('queueWorker: posted approved draft sales order', {
+        const result = await draftPostGuard.postDraftGuarded({
+          companyKey: injectedSessionManager ? 'injected' : currentCompany().key,
           approvalRequestId,
           draftEntry,
-          docEntry: salesOrder?.DocEntry ?? salesOrder?.docEntry ?? null,
-          docNum: salesOrder?.DocNum ?? salesOrder?.docNum ?? null,
+          post: () => postApprovedDraftFn(resolveSession(), draftEntry),
+          verify: () => lookupConvertedDocEntry(resolveSession(), approvalRequestId),
+          onParked: onDraftParked,
         });
+
+        if (result.outcome === 'posted') {
+          postedDraftKeys.add(postedKey);
+          workerLogger.info('queueWorker: posted approved draft sales order', {
+            approvalRequestId,
+            draftEntry,
+            docEntry: result.docEntry,
+            docNum: result.docNum,
+          });
+        } else if (result.outcome === 'skipped' && result.reason === 'already_converted') {
+          postedDraftKeys.add(postedKey);
+          workerLogger.info('queueWorker: draft was already converted in SAP', {
+            approvalRequestId,
+            draftEntry,
+            docEntry: result.docEntry,
+          });
+        } else if (result.outcome === 'parked') {
+          workerLogger.error('queueWorker: approved draft parked — no further posts will be attempted', {
+            approvalRequestId,
+            draftEntry,
+            parkReason: result.parkReason,
+            errorMessage: result.errorMessage,
+          });
+        }
       } catch (error) {
-        workerLogger.error('queueWorker: failed to post approved draft', {
+        // The guard itself failed (state file unreadable, etc). Never retry
+        // blind here — that is the behaviour that burned the numbers.
+        workerLogger.error('queueWorker: draft post guard failed; skipping this draft', {
           approvalRequestId,
           draftEntry,
           error: error?.message || String(error),
-          sapError: error?.meta?.cause ?? error?.response?.data ?? null,
         });
       }
     }

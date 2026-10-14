@@ -14,6 +14,32 @@ export const APPROVED_DRAFTS_PATH =
   '&$select=Code,Status,CurrentStage,ObjectType,IsDraft,ObjectEntry,DraftEntry,CreationDate';
 
 /**
+ * The final Sales Order DocEntry for an approval request, or null if SAP has
+ * not converted its draft yet. SAP flips IsDraft to 'N' and fills ObjectEntry
+ * with the new document's DocEntry at conversion, so this is the authoritative
+ * "did it actually post?" check.
+ *
+ * Used before any repeat SaveDraftToDocument attempt: a draft that already
+ * converted must never be POSTed again, both to avoid a duplicate Sales Order
+ * and to avoid burning another DocEntry.
+ *
+ * @param {{client: {get: Function}, ensureLoggedIn?: Function}} sessionManager
+ * @param {string|number} approvalRequestId
+ * @returns {Promise<number|null>}
+ */
+export async function lookupConvertedDocEntry(sessionManager, approvalRequestId) {
+  if (typeof sessionManager?.ensureLoggedIn === 'function') {
+    await sessionManager.ensureLoggedIn();
+  }
+  const response = await sessionManager.client.get(
+    `/ApprovalRequests(${encodeURIComponent(approvalRequestId)})?$select=Status,IsDraft,ObjectEntry`
+  );
+  const ar = response?.data ?? response;
+  const converted = String(ar?.IsDraft) === 'N' && Number(ar?.ObjectEntry) > 0;
+  return converted ? Number(ar.ObjectEntry) : null;
+}
+
+/**
  * An approval request is only handled when the SO was punched or updated on/after
  * this date (its ApprovalRequest.CreationDate). Editing a draft mints a new
  * request dated to the edit, so this catches both "punched" and "updated". A

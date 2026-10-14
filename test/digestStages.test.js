@@ -96,6 +96,30 @@ test('a recorded @AP_APPROVAL level overrides the recomputed approverPosition', 
   );
 });
 
+test('the forced-stage override always digests SAP user 58 (devarsh) at stage 2, never stage 1', () => {
+  // Same request set as `pending()`, but user 58 (not 11/22) sits at level 1 on
+  // request 201 and level 2 on request 202/203. Without the override he'd get
+  // two separate emails (4:30pm AND 6:30pm); with it, he's excluded from the
+  // stage-1 run entirely and included in stage-2 for all three requests.
+  const requests = [
+    { ...pending()[0], ApprovalRequestLines: [{ UserID: 58, StageCode: 1, Status: 'ardPending' }] },
+    { ...pending()[1], ApprovalRequestLines: [{ UserID: 11, StageCode: 1, Status: 'ardApproved' }, { UserID: 58, StageCode: 1, Status: 'ardPending' }] },
+    { ...pending()[2], ApprovalRequestLines: [{ UserID: 11, StageCode: 1, Status: 'ardApproved' }, { UserID: 58, StageCode: 2, Status: 'ardPending' }] },
+  ];
+
+  const stage1 = groupActionableByApprover(requests, { createdCutoff: null, stageFilter: 1 });
+  assert.equal(stage1.has('58'), false);
+
+  const stage2 = groupActionableByApprover(requests, { createdCutoff: null, stageFilter: 2 });
+  assert.deepEqual(
+    stage2.get('58')?.map((i) => i.approvalRequestId).sort(),
+    [201, 202, 203]
+  );
+  // The real position/level is preserved on the item — only the run it's
+  // filtered into changes.
+  assert.equal(stage2.get('58')[0].stageNumber, 1);
+});
+
 test('intOrFallback parses ints and falls back on blank/non-numeric', () => {
   assert.equal(intOrFallback('4', 9), 4);
   assert.equal(intOrFallback('', 9), 9);

@@ -42,6 +42,16 @@ export function companyQueueClientPath(companyHash) {
   return `${companyPath(companyHash)}/queue/client.js`;
 }
 
+/** Retry link for one parked draft, e.g. '/salesorder/api/v1/c/<hash>/draft-retry/<token>'. */
+export function companyDraftRetryPath(companyHash, retryToken) {
+  return `${companyPath(companyHash)}/draft-retry/${retryToken}`;
+}
+
+/** Absolute retry URL for the parked-draft alert email's button. */
+export function absoluteDraftRetryUrl(companyHash, retryToken) {
+  return `${absoluteOrigin()}${companyDraftRetryPath(companyHash, retryToken)}`;
+}
+
 /** Absolute action URL for the email button: origin + base path + action route. */
 export function absoluteActionUrl(companyHash, processId) {
   return `${absoluteOrigin()}${companyActionPath(companyHash, processId)}`;

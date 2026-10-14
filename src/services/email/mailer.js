@@ -22,13 +22,30 @@ export function getCompanyTransporter(companyKey, smtp) {
   return transporter;
 }
 
-/** The monitoring BCC address for a send, or undefined when unset or equal to the recipient. */
+/**
+ * The monitoring BCC for a send: EMAIL_BCC may list several addresses separated
+ * by commas or semicolons. Blanks and duplicates are dropped, and the
+ * recipient's own address is removed so nobody is both To and BCC on the same
+ * mail. Returns a comma-separated string for nodemailer, or undefined when
+ * nothing is left to BCC.
+ */
 export function resolveBccRecipient(recipientEmail, bcc = config.emailBcc) {
   if (!bcc) {
     return undefined;
   }
-  if (String(recipientEmail || '').trim().toLowerCase() === String(bcc).trim().toLowerCase()) {
-    return undefined;
+
+  const recipient = String(recipientEmail || '').trim().toLowerCase();
+  const seen = new Set();
+  const addresses = [];
+
+  for (const raw of String(bcc).split(/[,;]/)) {
+    const address = raw.trim();
+    if (!address) continue;
+    const key = address.toLowerCase();
+    if (key === recipient || seen.has(key)) continue;
+    seen.add(key);
+    addresses.push(address);
   }
-  return bcc;
+
+  return addresses.length ? addresses.join(',') : undefined;
 }

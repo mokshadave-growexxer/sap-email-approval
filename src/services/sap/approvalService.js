@@ -1,5 +1,7 @@
-import { currentSL } from '../company/companyContext.js';
+import { currentSL, currentCompany } from '../company/companyContext.js';
 import logger from '../../config/logger.js';
+import { draftPostGuard as realDraftPostGuard, passthroughDraftPostGuard } from './draftPostGuard.js';
+import { sendParkedDraftAlert } from '../email/draftPostAlert.js';
 
 export const STATUS = Object.freeze({
   APPROVE: 'ardApproved',
@@ -612,12 +614,67 @@ export class ApprovalService {
     }
 
     try {
-      const salesOrder = await this.postApprovedDraft(draftEntry);
+      // Shares the queue worker's guard and its persisted state, so the inline
+      // post and the 30s poll can never both spend a DocEntry on the same
+      // draft, and a draft parked by one is not retried by the other.
+      const guard = this._sessionManager ? passthroughDraftPostGuard : realDraftPostGuard;
+      const guarded = await guard.postDraftGuarded({
+        companyKey: this._sessionManager ? 'injected' : currentCompany().key,
+        approvalRequestId,
+        draftEntry,
+        post: () => this.postApprovedDraft(draftEntry),
+        verify: async () => {
+          const ar = await this._getApprovalRequest(
+            approvalRequestId,
+            '$select=Status,IsDraft,ObjectEntry'
+          );
+          return String(ar?.IsDraft) === 'N' && Number(ar?.ObjectEntry) > 0 ? Number(ar.ObjectEntry) : null;
+        },
+        onParked: sendParkedDraftAlert,
+      });
+
+      // The draft is a Sales Order now: either this call posted it, or the
+      // guard confirmed against SAP that it already had been.
+      const isPosted =
+        guarded.outcome === 'posted' ||
+        (guarded.outcome === 'skipped' &&
+          (guarded.reason === 'already_posted' || guarded.reason === 'already_converted'));
+
+      if (guarded.outcome === 'parked') {
+        return {
+          attempted: true,
+          success: false,
+          draftEntry: String(draftEntry),
+          parked: true,
+          error:
+            `Approval succeeded in SAP, but posting the draft failed: ${guarded.errorMessage}. ` +
+            'It has been reported and will not be retried automatically.',
+        };
+      }
+
+      if (!isPosted) {
+        // A transient failure (retry already scheduled), a backoff window, or a
+        // post in flight elsewhere. The queue worker owns it from here — this
+        // is not an approval failure, and it must not be re-POSTed now.
+        return {
+          attempted: true,
+          success: false,
+          draftEntry: String(draftEntry),
+          deferred: true,
+          error:
+            'Approval succeeded in SAP, but the draft has not been posted yet ' +
+            `(${guarded.reason ?? guarded.outcome}). An automatic retry is scheduled.`,
+        };
+      }
+
+      const salesOrder = guarded.salesOrder ?? { DocEntry: guarded.docEntry ?? null };
       logger.info('ApprovalService.decide: SaveDraftToDocument succeeded', {
         approvalRequestId,
         draftEntry: String(draftEntry),
         docEntry: salesOrder?.DocEntry ?? salesOrder?.docEntry ?? null,
         docNum: salesOrder?.DocNum ?? salesOrder?.docNum ?? null,
+        guardOutcome: guarded.outcome,
+        guardReason: guarded.reason ?? null,
       });
       return {
         attempted: true,

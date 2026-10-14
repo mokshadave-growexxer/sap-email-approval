@@ -16,6 +16,13 @@ import { absoluteQueueUrl } from '../../utils/appUrls.js';
 
 // ---------- Pure helpers (unit-tested) ----------
 
+// Hard override: devarsh (SAP user 58 in this company) must always be digested
+// in the 6:30pm/stage-2 run, never the 4:30pm/stage-1 run — he sits at level 1
+// on some SOs and level 2 on others, so without this he'd get both. This only
+// steers WHICH scheduled run picks him up; it does not touch the real recorded
+// level (approvalPosition/history/footprints stay accurate).
+const FORCED_DIGEST_STAGE_BY_SAP_USER_ID = new Map([[58, 2]]);
+
 /**
  * Group live pending approval requests by the approver who may act on each RIGHT
  * NOW (the current actionable line). Mirrors the instant channel's "who to email"
@@ -65,9 +72,14 @@ export function groupActionableByApprover(
       const recordedLevel = levelsByKey?.get(`${String(approvalRequestId)}:${String(approverUserId)}`);
       const stageNumber = recordedLevel ?? line.approverPosition ?? null;
 
+      // Which scheduled run this line counts toward — normally the same as
+      // stageNumber, except for a hardcoded per-approver override (see
+      // FORCED_DIGEST_STAGE_BY_SAP_USER_ID above).
+      const digestFilterStage = FORCED_DIGEST_STAGE_BY_SAP_USER_ID.get(Number(approverUserId)) ?? stageNumber;
+
       // When a stage filter is set (a per-stage scheduled send), only include SOs
       // currently awaiting that stage's approver.
-      if (stageFilter != null && stageNumber !== stageFilter) {
+      if (stageFilter != null && digestFilterStage !== stageFilter) {
         continue;
       }
 

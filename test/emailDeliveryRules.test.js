@@ -48,8 +48,27 @@ test('subject carries the SO number and the DocDate (dd/mm/yyyy)', () => {
   assert.equal(buildApprovalSubject(30064, null), 'Approval Required: Sales Order 30064');
 });
 
-test('BCC is the configured monitoring address, deduped against the recipient', () => {
-  assert.equal(resolveBccRecipient('real.approver@matangiindustries.com'), config.emailBcc);
-  assert.equal(resolveBccRecipient(config.emailBcc), undefined);
-  assert.equal(resolveBccRecipient(String(config.emailBcc).toUpperCase()), undefined);
+test('BCC is every configured monitoring address, deduped against the recipient', () => {
+  const configured = String(config.emailBcc)
+    .split(/[,;]/)
+    .map((address) => address.trim())
+    .filter(Boolean);
+
+  assert.equal(resolveBccRecipient('real.approver@matangiindustries.com'), configured.join(','));
+
+  // An approver who is themselves a monitoring address is not also BCC'd.
+  const withoutFirst = configured.slice(1).join(',') || undefined;
+  assert.equal(resolveBccRecipient(configured[0]), withoutFirst);
+  assert.equal(resolveBccRecipient(configured[0].toUpperCase()), withoutFirst);
+});
+
+test('BCC parses lists, trims, dedupes and drops the recipient', () => {
+  assert.equal(resolveBccRecipient('a@x.com', 'b@x.com, c@x.com'), 'b@x.com,c@x.com');
+  assert.equal(resolveBccRecipient('a@x.com', ' b@x.com ; c@x.com '), 'b@x.com,c@x.com');
+  assert.equal(resolveBccRecipient('B@X.COM', 'b@x.com, c@x.com'), 'c@x.com');
+  assert.equal(resolveBccRecipient('a@x.com', 'b@x.com, B@x.com'), 'b@x.com');
+  assert.equal(resolveBccRecipient('b@x.com', 'b@x.com'), undefined);
+  assert.equal(resolveBccRecipient('a@x.com', ' , ; '), undefined);
+  assert.equal(resolveBccRecipient('a@x.com', ''), undefined);
+  assert.equal(resolveBccRecipient('a@x.com', null), undefined);
 });

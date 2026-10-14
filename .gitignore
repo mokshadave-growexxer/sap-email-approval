@@ -6,3 +6,6 @@ node_modules
 .cursorignore
 certs
 session-backup.md
+
+# Runtime state: which approved drafts have posted / are parked (DRAFT_POST_STATE_DIR).
+data
