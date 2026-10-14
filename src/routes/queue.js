@@ -19,6 +19,7 @@ import {
   companyQueuePath,
   companyQueueFootprintRegisterPath,
   companyQueueClientPath,
+  linkTokenFromRequest,
 } from '../utils/appUrls.js';
 import { QUEUE_CLIENT_JS } from './queueClientScript.js';
 
@@ -459,11 +460,13 @@ router.post(
 // that process's approver here and hand off to the bulk page with a freshly
 // signed digest token. The bulk page re-derives the queue live from SAP, so an
 // SO already decided — including the one this email was about — is not listed.
+// The token arrives as /pending?t=<token>; /pending/<token> is the legacy form
+// (too long for IIS's 260-char path-segment limit, kept only for completeness).
 router.get(
-  '/pending/:token',
+  ['/pending', '/pending/:token'],
   asyncHandler(async (req, res) => {
     res.set('Cache-Control', 'no-store');
-    const verified = verifyPendingApprovalsToken(req.params.token);
+    const verified = verifyPendingApprovalsToken(linkTokenFromRequest(req));
     if (!verified.valid) {
       return res.status(verified.expired ? 410 : 404).send(
         renderMessagePage({

@@ -11,6 +11,7 @@ import logger from '../config/logger.js';
 import { asyncHandler } from '../utils/asyncHandler.js';
 import { currentCompany } from '../services/company/companyContext.js';
 import { verifyDraftRetryToken } from '../utils/draftRetryToken.js';
+import { linkTokenFromRequest } from '../utils/appUrls.js';
 import { clearPark, getRecord, DRAFT_POST_STATE } from '../services/sap/draftPostState.js';
 
 const router = express.Router({ mergeParams: true });
@@ -26,10 +27,12 @@ function page(title, body, tone = '#1f6feb') {
 </div></body></html>`;
 }
 
+// The token arrives as /draft-retry?t=<token> (see appUrls.js for why it is not
+// a path segment); /draft-retry/<token> is still accepted for alerts already sent.
 router.get(
-  '/draft-retry/:token',
+  ['/draft-retry', '/draft-retry/:token'],
   asyncHandler(async (req, res) => {
-    const verdict = verifyDraftRetryToken(req.params.token);
+    const verdict = verifyDraftRetryToken(linkTokenFromRequest(req));
 
     if (!verdict.valid) {
       return res

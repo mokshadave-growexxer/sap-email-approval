@@ -26,8 +26,8 @@ test('absolute queue URL combines origin, base path and queue route', () => {
 
 test('pending approvals URL is a stable, process-keyed company route', async () => {
   const { companyPendingApprovalsPath, absolutePendingApprovalsUrl } = await import('../src/utils/appUrls.js');
-  assert.equal(companyPendingApprovalsPath('HASH', 'PID'), `${config.basePath}/api/v1/c/HASH/pending/PID`);
+  assert.equal(companyPendingApprovalsPath('HASH', 'PID'), `${config.basePath}/api/v1/c/HASH/pending?t=PID`);
   const url = absolutePendingApprovalsUrl('HASH', 'PID');
-  assert.ok(url.endsWith(`${config.basePath}/api/v1/c/HASH/pending/PID`), url);
+  assert.ok(url.endsWith(`${config.basePath}/api/v1/c/HASH/pending?t=PID`), url);
   assert.ok(url.startsWith(String(config.appBaseUrl).replace(/\/+$/, '')), url);
 });
