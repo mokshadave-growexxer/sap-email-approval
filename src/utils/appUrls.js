@@ -42,6 +42,17 @@ export function companyQueueClientPath(companyHash) {
   return `${companyPath(companyHash)}/queue/client.js`;
 }
 
+/**
+ * "Pending approvals" entry point carried by an instant approval email and the
+ * decision page, e.g. '/salesorder/api/v1/c/<hash>/pending/<token>'. The token
+ * (see pendingApprovalsToken.js) names one process and expires after 10 days;
+ * the route resolves that process's approver and redirects to a freshly signed
+ * bulk page link.
+ */
+export function companyPendingApprovalsPath(companyHash, pendingToken) {
+  return `${companyPath(companyHash)}/pending/${pendingToken}`;
+}
+
 /** Retry link for one parked draft, e.g. '/salesorder/api/v1/c/<hash>/draft-retry/<token>'. */
 export function companyDraftRetryPath(companyHash, retryToken) {
   return `${companyPath(companyHash)}/draft-retry/${retryToken}`;
@@ -60,6 +71,11 @@ export function absoluteActionUrl(companyHash, processId) {
 /** Absolute bulk digest URL for the digest email's "Take Action" button. */
 export function absoluteQueueUrl(companyHash, digestToken) {
   return `${absoluteOrigin()}${companyQueuePath(companyHash, digestToken)}`;
+}
+
+/** Absolute URL for the approval email's "Pending approvals" button. */
+export function absolutePendingApprovalsUrl(companyHash, pendingToken) {
+  return `${absoluteOrigin()}${companyPendingApprovalsPath(companyHash, pendingToken)}`;
 }
 
 function absoluteOrigin() {

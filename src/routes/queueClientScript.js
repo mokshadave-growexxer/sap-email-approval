@@ -20,6 +20,12 @@ export const QUEUE_CLIENT_JS = `(function () {
     var searchBox = document.getElementById('searchBox');
     var selectedCountEl = document.getElementById('selectedCount');
     var settled = false;
+    // If the location cannot be fetched for ANY reason (denied, timed out, hung,
+    // unsupported, non-HTTPS, register error), the approver may still decide
+    // without it once this much time has passed since the page started.
+    var FALLBACK_AFTER_MS = 10000;
+    var REGISTER_TIMEOUT_MS = 15000;
+    var startedAt = Date.now();
     var footprintOk = false;
 
     function checks() { return Array.prototype.slice.call(form.querySelectorAll('.row-check')); }
@@ -71,12 +77,26 @@ export const QUEUE_CLIENT_JS = `(function () {
     function register(body) {
       return platformVersion().then(function (pv) {
         var payload = Object.assign({}, body, { ua_platform_version: pv });
-        return fetch(registerUrl, {
+        var request = fetch(registerUrl, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(payload),
         }).then(function (r) { return r.json(); });
+        var timeout = new Promise(function (_, reject) {
+          setTimeout(function () { reject(new Error('register timeout')); }, REGISTER_TIMEOUT_MS);
+        });
+        return Promise.race([request, timeout]);
       });
+    }
+
+    function clientTimezone() {
+      try { return Intl.DateTimeFormat().resolvedOptions().timeZone || null; } catch (e) { return null; }
+    }
+
+    function afterFallbackDelay(fn) {
+      var remaining = FALLBACK_AFTER_MS - (Date.now() - startedAt);
+      if (remaining > 0) setTimeout(fn, remaining);
+      else fn();
     }
 
     function applyResult(res, okMsg, blockedMsg) {
@@ -99,20 +119,41 @@ export const QUEUE_CLIENT_JS = `(function () {
       updateButtons();
     }
 
+    // Registers a location-less footprint immediately, but only unlocks the
+    // decision once FALLBACK_AFTER_MS has elapsed since the page started.
+    function proceedWithoutLocation(method) {
+      setStatus('Location could not be fetched — you will be able to continue without it shortly…');
+      var registration = register({ process_id: processId, geo_method: method, timezone: clientTimezone() })
+        .then(function (res) { return { res: res }; }, function () { return { error: true }; });
+      afterFallbackDelay(function () {
+        registration.then(function (outcome) {
+          if (outcome.error) {
+            fail('Could not register your device. Please check your connection and reload this page.');
+            return;
+          }
+          applyResult(
+            outcome.res,
+            'Location unavailable — you may approve or reject without it.',
+            'This approval link could not be verified. Please reload this page or reopen the link from your email.'
+          );
+        });
+      });
+    }
+
     function onGranted(pos) {
       if (settled) return;
       settled = true;
-      var tz = Intl.DateTimeFormat().resolvedOptions().timeZone;
       register({
         process_id: processId,
         lat: pos.coords.latitude,
         lon: pos.coords.longitude,
         accuracy: pos.coords.accuracy,
-        timezone: tz,
+        timezone: clientTimezone(),
       }).then(function (res) {
-        applyResult(res, 'Verified — you may approve or reject.', 'Could not verify your location. Please enable location access and reload.');
+        if (res && res.session_id) applyResult(res, 'Verified — you may approve or reject.', '');
+        else proceedWithoutLocation('unavailable');
       }).catch(function () {
-        fail('Could not register your footprint. Please reload and try again.');
+        proceedWithoutLocation('unavailable');
       });
     }
 
@@ -122,16 +163,7 @@ export const QUEUE_CLIENT_JS = `(function () {
       var method = 'unavailable';
       if (err && err.code === 1) method = 'denied';
       else if (err && err.code === 3) method = 'timeout';
-      var tz = Intl.DateTimeFormat().resolvedOptions().timeZone;
-      register({ process_id: processId, geo_method: method, timezone: tz }).then(function (res) {
-        applyResult(
-          res,
-          'Verified (location unavailable) — you may proceed.',
-          'Location access is required to approve or reject. Please enable location permissions and reload this page.'
-        );
-      }).catch(function () {
-        fail('Location access is required. Please enable location permissions and reload this page.');
-      });
+      proceedWithoutLocation(method);
     }
 
     // Selection wiring.
@@ -188,21 +220,22 @@ export const QUEUE_CLIENT_JS = `(function () {
 
     updateButtons();
 
-    if (!window.isSecureContext) {
-      fail('This page must be opened over HTTPS (or on localhost) so your location can be verified.');
-      return;
-    }
-    if (!navigator.geolocation) {
+    if (!window.isSecureContext || !navigator.geolocation) {
       onError({ code: 2 });
       return;
     }
 
-    var watchdog = setTimeout(function () { onError({ code: 3 }); }, 12000);
-    navigator.geolocation.getCurrentPosition(
-      function (pos) { clearTimeout(watchdog); onGranted(pos); },
-      function (err) { clearTimeout(watchdog); onError(err); },
-      { enableHighAccuracy: false, timeout: 10000, maximumAge: 0 }
-    );
+    var watchdog = setTimeout(function () { onError({ code: 3 }); }, FALLBACK_AFTER_MS);
+    try {
+      navigator.geolocation.getCurrentPosition(
+        function (pos) { clearTimeout(watchdog); onGranted(pos); },
+        function (err) { clearTimeout(watchdog); onError(err); },
+        { enableHighAccuracy: false, timeout: FALLBACK_AFTER_MS, maximumAge: 0 }
+      );
+    } catch (e) {
+      clearTimeout(watchdog);
+      onError({ code: 2 });
+    }
   }
 
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init);

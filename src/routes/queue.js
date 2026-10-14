@@ -1,7 +1,9 @@
 import express from 'express';
 import logger from '../config/logger.js';
 import { asyncHandler } from '../utils/asyncHandler.js';
-import { verifyDigestToken } from '../utils/digestToken.js';
+import { verifyDigestToken, signDigestToken } from '../utils/digestToken.js';
+import { verifyPendingApprovalsToken } from '../utils/pendingApprovalsToken.js';
+import { getProcess } from '../services/approval/processStore.js';
 import { resolveSapUser } from '../services/email/approvalEmailService.js';
 import { buildApproverQueueForUser } from '../services/digest/digestService.js';
 import { getApproverCredential, upsertApproverCredential } from '../services/security/userCredentialStore.js';
@@ -449,6 +451,40 @@ router.post(
       return res.status(201).json({ session_id: result.sessionId });
     }
     return res.status(201).json({ session_id: null, reason: result.geoMethod });
+  })
+);
+
+// "Pending approvals" button in an instant approval email / on the decision page.
+// The link carries a signed token naming one process (valid 10 days); resolve
+// that process's approver here and hand off to the bulk page with a freshly
+// signed digest token. The bulk page re-derives the queue live from SAP, so an
+// SO already decided — including the one this email was about — is not listed.
+router.get(
+  '/pending/:token',
+  asyncHandler(async (req, res) => {
+    res.set('Cache-Control', 'no-store');
+    const verified = verifyPendingApprovalsToken(req.params.token);
+    if (!verified.valid) {
+      return res.status(verified.expired ? 410 : 404).send(
+        renderMessagePage({
+          title: verified.expired ? 'Link Expired' : 'Invalid Link',
+          message: verified.expired
+            ? 'This pending approvals link has expired (links are valid for 10 days). Please use the button in a more recent approval email.'
+            : 'This pending approvals link is invalid or no longer exists.',
+        })
+      );
+    }
+    const process = await getProcess(verified.processId);
+    if (!process || process.sap_user_id == null || process.sap_user_id === '') {
+      return res.status(404).send(
+        renderMessagePage({
+          title: 'Invalid Link',
+          message: 'This pending approvals link is invalid or no longer exists.',
+        })
+      );
+    }
+    const token = signDigestToken({ sapUserId: process.sap_user_id });
+    return res.redirect(302, companyQueuePath(currentCompanyHash(), token));
   })
 );
 

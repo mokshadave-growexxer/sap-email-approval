@@ -26,3 +26,16 @@ test('the enrollment page shows a password field and the notice', () => {
   assert.match(html, /<input[^>]*type="password"[^>]*name="sap_password"[^>]*required/);
   assert.match(html, /First time here/);
 });
+
+test('decision page has a "Pending approvals" link carrying a signed token for this process', async () => {
+  const { companyPendingApprovalsPath } = await import('../src/utils/appUrls.js');
+  const { verifyPendingApprovalsToken } = await import('../src/utils/pendingApprovalsToken.js');
+  const html = renderDecisionPage({ process: { approval_request_id: 1, level: 1, user_code: 'u' }, processId: 'p1', companyHash: 'HASH' });
+  const match = /<a class="pending-link" href="([^"]+)">Pending approvals<\/a>/.exec(html);
+  assert.ok(match, 'pending link present');
+  const prefix = companyPendingApprovalsPath('HASH', '');
+  assert.ok(match[1].startsWith(prefix), match[1]);
+  const verified = verifyPendingApprovalsToken(match[1].slice(prefix.length));
+  assert.equal(verified.valid, true);
+  assert.equal(verified.processId, 'p1');
+});

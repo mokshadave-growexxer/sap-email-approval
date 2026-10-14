@@ -4,7 +4,8 @@ import { createProcess, getProcess, PROCESS_STATUS } from '../approval/processSt
 import { getDraftAttachments } from '../sap/attachmentService.js';
 import { getSalesOrderChangeStatus } from '../sap/draftStatusService.js';
 import { currentSL, currentCompany, currentCompanyHash } from '../company/companyContext.js';
-import { absoluteActionUrl } from '../../utils/appUrls.js';
+import { absoluteActionUrl, absolutePendingApprovalsUrl } from '../../utils/appUrls.js';
+import { signPendingApprovalsToken } from '../../utils/pendingApprovalsToken.js';
 import logger from '../../config/logger.js';
 
 // Development-only fallback so testing is not blocked if SAP /Users resolution
@@ -389,6 +390,7 @@ function buildApprovalEmailHtml({
   remark = '',
   documentLines,
   actionUrl,
+  pendingApprovalsUrl = null,
   history = [],
   changeStatus = null,
 }) {
@@ -445,9 +447,16 @@ function buildApprovalEmailHtml({
           </tr>
           <tr>
             <td style="padding:28px 32px 8px 32px;">
-              <p style="margin:0 0 16px 0; color:#333333; font-size:15px;">
-                Hi,
-              </p>
+              <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="margin:0 0 16px 0;">
+                <tr>
+                  <td style="color:#333333; font-size:15px; vertical-align:middle;">Hi,</td>
+                  ${
+                    pendingApprovalsUrl
+                      ? `<td align="right" style="vertical-align:middle;"><a href="${pendingApprovalsUrl}" style="display:inline-block; background-color:#ffffff; color:#1a2b4c; text-decoration:none; font-size:13px; font-weight:bold; padding:8px 16px; border:2px solid #1a2b4c; border-radius:6px;">Pending approvals</a></td>`
+                      : ''
+                  }
+                </tr>
+              </table>
               <p style="margin:0 0 20px 0; color:#333333; font-size:15px;">
                 A Sales Order draft is waiting for your approval.
               </p>
@@ -586,6 +595,10 @@ export async function sendApprovalEmail({ approvalRequestId, approverUserId, app
   }
 
   const actionUrl = absoluteActionUrl(currentCompanyHash(), effectiveProcessId);
+  const pendingApprovalsUrl = absolutePendingApprovalsUrl(
+    currentCompanyHash(),
+    signPendingApprovalsToken({ processId: effectiveProcessId })
+  );
 
   const html = buildApprovalEmailHtml({
     cardName: draftEmailData.cardName,
@@ -598,6 +611,7 @@ export async function sendApprovalEmail({ approvalRequestId, approverUserId, app
     remark: draftEmailData.remark,
     documentLines: draftEmailData.documentLines,
     actionUrl,
+    pendingApprovalsUrl,
     history,
     changeStatus,
   });

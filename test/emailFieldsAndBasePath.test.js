@@ -126,3 +126,19 @@ test('freight total is omitted when quantity or per-kg freight is absent', () =>
   });
   assert.doesNotMatch(html, /Total:/);
 });
+
+test('approval email shows a "Pending approvals" button linking to the given URL', () => {
+  const html = buildApprovalEmailHtml({
+    cardName: 'ACME',
+    documentLines: [],
+    actionUrl: 'https://x/action/P1',
+    pendingApprovalsUrl: 'https://x/pending/P1',
+  });
+  assert.match(html, /<a href="https:\/\/x\/pending\/P1"[^>]*>Pending approvals<\/a>/);
+  assert.ok(html.indexOf('Pending approvals') < html.indexOf('Take Action'), 'button sits at the top');
+});
+
+test('approval email omits the "Pending approvals" button when no URL is given', () => {
+  const html = buildApprovalEmailHtml({ cardName: 'ACME', documentLines: [], actionUrl: 'https://x/a' });
+  assert.ok(!html.includes('Pending approvals'));
+});

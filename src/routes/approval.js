@@ -16,10 +16,12 @@ import { logFailedDecision } from '../services/audit/decisionLogService.js';
 import { executeDecision, DECISION_OUTCOME } from '../services/approval/decisionExecutor.js';
 import { currentCompanyHash } from '../services/company/companyContext.js';
 import { getApproverCredential, upsertApproverCredential } from '../services/security/userCredentialStore.js';
+import { signPendingApprovalsToken } from '../utils/pendingApprovalsToken.js';
 import {
   companyActionPath,
   companyFootprintClientPath,
   companyFootprintRegisterPath,
+  companyPendingApprovalsPath,
 } from '../utils/appUrls.js';
 
 const router = express.Router();
@@ -71,9 +73,15 @@ function renderDecisionPage({ process, processId, companyHash, needsPassword = f
     .reject { background:#b42318; }
     #geo-retry { background:#374151; display:none; }
     .small { color:#6b7280; font-size:12px; margin-top: 16px; line-height:1.5; }
+    .topbar { display:flex; justify-content:flex-end; padding: 16px 24px 0; }
+    .pending-link { display:inline-block; background:#fff; color:#1a2b4c; border:2px solid #1a2b4c; border-radius:8px; padding:9px 16px; font-size:14px; font-weight:700; text-decoration:none; }
+    .pending-link:hover { background:#1a2b4c; color:#fff; }
   </style>
 </head>
 <body>
+  <div class="topbar">
+    <a class="pending-link" href="${escapeHtml(companyPendingApprovalsPath(companyHash, signPendingApprovalsToken({ processId })))}">Pending approvals</a>
+  </div>
   <div class="wrap">
     <div class="card">
       <div class="head">${escapeHtml(title)}</div>

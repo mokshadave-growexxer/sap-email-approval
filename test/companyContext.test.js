@@ -13,9 +13,9 @@ import {
 } from '../src/services/company/companyContext.js';
 
 test('parseCompanies: parses key:schema pairs (schema == companyDb)', () => {
-  const companies = parseCompanies('millp:ZZ_TMILLP_01_04_26,mspl:ZZ_TMSPL_15_07_26');
+  const companies = parseCompanies('millp:ZZ_TMILLP_15_09_26,mspl:ZZ_TMSPL_15_07_26');
   assert.deepEqual(companies, [
-    { key: 'millp', schema: 'ZZ_TMILLP_01_04_26', companyDb: 'ZZ_TMILLP_01_04_26' },
+    { key: 'millp', schema: 'ZZ_TMILLP_15_09_26', companyDb: 'ZZ_TMILLP_15_09_26' },
     { key: 'mspl', schema: 'ZZ_TMSPL_15_07_26', companyDb: 'ZZ_TMSPL_15_07_26' },
   ]);
 });
