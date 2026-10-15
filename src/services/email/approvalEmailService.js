@@ -6,6 +6,7 @@ import { getSalesOrderChangeStatus } from '../sap/draftStatusService.js';
 import { currentSL, currentCompany, currentCompanyHash } from '../company/companyContext.js';
 import { absoluteActionUrl, absolutePendingApprovalsUrl } from '../../utils/appUrls.js';
 import { signPendingApprovalsToken } from '../../utils/pendingApprovalsToken.js';
+import { query, table } from '../sap/hanaClient.js';
 import logger from '../../config/logger.js';
 
 // Development-only fallback so testing is not blocked if SAP /Users resolution
@@ -61,25 +62,59 @@ export function buildApprovalSubject(docNum, docDate) {
  * @param {number|string} sapUserId - SAP UserID / InternalKey from the approval line.
  * @returns {Promise<{userCode: string|null, email: string|null, name: string|null}>}
  */
-async function resolveSapUser(sapUserId) {
+async function resolveSapUser(
+  sapUserId,
+  { fromServiceLayer = readSapUserFromServiceLayer, fromHana = readSapUserFromHana } = {}
+) {
   try {
-    await currentSL().ensureLoggedIn();
-    const response = await currentSL().client.get(
-      `/Users(${encodeURIComponent(sapUserId)})?$select=UserCode,UserName,eMail`
-    );
-    const user = response?.data ?? response;
-    return {
-      userCode: user?.UserCode ?? null,
-      email: user?.eMail ?? null,
-      name: user?.UserName ?? null,
-    };
+    const user = await fromServiceLayer(sapUserId);
+    if (user?.userCode) return user;
   } catch (error) {
-    logger.warn('approvalEmailService: SAP /Users resolution failed', {
+    logger.warn('approvalEmailService: SAP /Users resolution failed, falling back to HANA OUSR', {
       sapUserId,
       error: error?.message || String(error),
     });
-    return { userCode: null, email: null, name: null };
   }
+
+  // The Service Layer is unavailable at times (e.g. "Fail to connect to SLD").
+  // OUSR holds the same UserCode/email, so read it directly rather than leave
+  // the approver unresolved. Read-only.
+  try {
+    const user = await fromHana(sapUserId);
+    if (user?.userCode) return user;
+  } catch (error) {
+    logger.warn('approvalEmailService: HANA OUSR resolution failed', {
+      sapUserId,
+      error: error?.message || String(error),
+    });
+  }
+  return { userCode: null, email: null, name: null };
+}
+
+async function readSapUserFromServiceLayer(sapUserId) {
+  await currentSL().ensureLoggedIn();
+  const response = await currentSL().client.get(
+    `/Users(${encodeURIComponent(sapUserId)})?$select=UserCode,UserName,eMail`
+  );
+  const user = response?.data ?? response;
+  return {
+    userCode: user?.UserCode ?? null,
+    email: user?.eMail ?? null,
+    name: user?.UserName ?? null,
+  };
+}
+
+async function readSapUserFromHana(sapUserId) {
+  const id = Number.parseInt(sapUserId, 10);
+  if (!Number.isFinite(id)) return null;
+  const rows = await query(`SELECT "USER_CODE","U_NAME","E_Mail" FROM ${table('OUSR')} WHERE "USERID" = ?`, [id]);
+  const user = rows[0];
+  if (!user) return null;
+  return {
+    userCode: user.USER_CODE ?? null,
+    email: user.E_Mail || null,
+    name: user.U_NAME ?? null,
+  };
 }
 
 const DEV_TEST_APPROVER_MAP = Object.freeze({
